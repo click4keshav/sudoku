@@ -19,7 +19,7 @@ export default function SizePicker({ layout, onChange }: SizePickerProps) {
 
   return (
     <View style={styles.wrap}>
-      <Text style={styles.heading}>Select game type</Text>
+      <Text style={styles.heading}>Choose Your Game</Text>
       <Pressable
         onPress={() => setOpen(true)}
         style={styles.trigger}
