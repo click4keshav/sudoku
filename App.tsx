@@ -6,6 +6,7 @@ import type { User } from '@supabase/supabase-js';
 import { getCurrentUser, signInWithGoogle, signOutUser } from './lib/auth';
 import { recordGameRunToSupabase } from './lib/gameSync';
 import { syncUserDataUponLogin } from './lib/gameSync';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import * as Application from 'expo-application';
 import {
   Alert,
@@ -122,6 +123,8 @@ export default function App() {
   // Dedicated picker states for the Home screen selection
   const [pickerLayout, setPickerLayout] = useState<BoardLayout>(DEFAULT_BOARD_LAYOUT);
   const [pickerDifficulty, setPickerDifficulty] = useState<Difficulty>('medium');
+
+  const insets = useSafeAreaInsets();
 
   const [gameId, setGameId] = useState<string>(() => Date.now().toString());
   const [values, setValues] = useState<CellValue[][]>([]);
@@ -1109,7 +1112,11 @@ export default function App() {
           <View
             style={[
               styles.bottomTabBar,
-              { backgroundColor: theme.cardBg, borderTopColor: theme.blockBg },
+              { backgroundColor: theme.cardBg, 
+                borderTopColor: theme.blockBg,
+                paddingBottom: 24,
+                height: 72,
+              },
             ]}
           >
             <Pressable onPress={() => setTab('home')} style={styles.tabItem}>
