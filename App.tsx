@@ -4,9 +4,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { supabase } from './lib/supabase';
 import type { User } from '@supabase/supabase-js';
 import { getCurrentUser, signInWithGoogle, signOutUser } from './lib/auth';
-import { recordGameRunToSupabase } from './lib/gameSync';
-import { syncUserDataUponLogin } from './lib/gameSync';
-import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import { recordGameRunToSupabase, syncUserDataUponLogin } from './lib/gameSync';
 import * as Application from 'expo-application';
 import {
   Alert,
@@ -123,8 +121,6 @@ export default function App() {
   // Dedicated picker states for the Home screen selection
   const [pickerLayout, setPickerLayout] = useState<BoardLayout>(DEFAULT_BOARD_LAYOUT);
   const [pickerDifficulty, setPickerDifficulty] = useState<Difficulty>('medium');
-
-  const insets = useSafeAreaInsets();
 
   const [gameId, setGameId] = useState<string>(() => Date.now().toString());
   const [values, setValues] = useState<CellValue[][]>([]);
@@ -408,7 +404,6 @@ export default function App() {
     ]);
   }, [errors, mistakes, notes, values]);
 
-
   const startNewGame = useCallback(
     (targetLayout: BoardLayout, targetDifficulty: Difficulty) => {
       setLayout(targetLayout);
@@ -544,7 +539,7 @@ export default function App() {
         ],
       );
     },
-    [difficulty, layout, mistakes, startNewGame, stats, streakKey, deviceId],
+    [difficulty, layout, mistakes, startNewGame, stats, streakKey, deviceId, hintsUsed],
   );
 
   const recordLoss = useCallback(async (finalMistakes: number) => {
@@ -555,7 +550,7 @@ export default function App() {
       gridSize: layout.size,
       difficulty: difficulty,
       timeSeconds: timerSeconds,
-      mistakes: finalMistakes, // 👈 use the passed mistake count
+      mistakes: finalMistakes,
       hintsUsed: hintsUsed,
       status: 'lost',
       deviceId: deviceId,
@@ -723,7 +718,7 @@ export default function App() {
       if (!isCorrect) {
         setMistakes(nextMistakes);
         if (settings.limitMistakes && nextMistakes >= 3) {
-          recordLoss(nextMistakes); // 👈 Put it right here! Pass nextMistakes into it.
+          recordLoss(nextMistakes);
           Alert.alert(
             'Game Over',
             'You made 3 mistakes. Better luck next time!',
@@ -924,7 +919,7 @@ export default function App() {
         <View style={styles.tabContainer}>
           <View style={styles.appHeader}>
             <Text style={[styles.appHeaderTitle, { color: theme.textPrimary }]}>
-              {tab === 'home' ? 'RamCraft' : tab === 'stats' ? 'Statistics' : 'Profile'}
+              {tab === 'home' ? 'Ramcraft' : tab === 'stats' ? 'Statistics' : 'Profile'}
             </Text>
             <View style={styles.topRightActions}>
               <Pressable
@@ -963,7 +958,7 @@ export default function App() {
                   resizeMode="contain"
                 />
                 <Text style={[styles.title, { color: theme.textPrimary }]}>
-                  RamCraft
+                  Ramcraft
                 </Text>
                 <Text style={[styles.subtitle, { color: theme.textSecondary }]}>
                   Classic Logic Challenge
@@ -984,7 +979,7 @@ export default function App() {
                       </Text>
                     </View>
                     <Text style={styles.resumeDetails}>
-                    {layout.label} • {difficulty.toUpperCase()} • Mistakes:{' '}
+                      {layout.label} • {difficulty.toUpperCase()} • Mistakes:{' '}
                       {settings.limitMistakes ? `${mistakes}/3` : mistakes}
                     </Text>
                   </Pressable>
@@ -1069,7 +1064,7 @@ export default function App() {
                 )}
               </View>
               <Text style={[styles.profileName, { color: theme.textPrimary }]}>
-                {user?.user_metadata?.full_name || user?.user_metadata?.name || (user ? 'RamCraft Player' : 'Guest Player')}
+                {user?.user_metadata?.full_name || user?.user_metadata?.name || (user ? 'Ramcraft Player' : 'Guest Player')}
               </Text>
               <Text style={[styles.profileId, { color: theme.textSecondary }]}>
                 {user ? user.email : `Device ID: ${deviceId}`}
@@ -1112,7 +1107,8 @@ export default function App() {
           <View
             style={[
               styles.bottomTabBar,
-              { backgroundColor: theme.cardBg, 
+              {
+                backgroundColor: theme.cardBg,
                 borderTopColor: theme.blockBg,
                 paddingBottom: 24,
                 height: 72,
@@ -1553,10 +1549,11 @@ const styles = StyleSheet.create({
   },
   bottomTabBar: {
     flexDirection: 'row',
-    height: 60,
+    height: 72,
     borderTopWidth: 1,
     justifyContent: 'space-around',
     alignItems: 'center',
+    paddingBottom: 24,
   },
   tabItem: {
     alignItems: 'center',
