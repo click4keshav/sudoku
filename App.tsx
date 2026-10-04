@@ -4,6 +4,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { supabase } from './lib/supabase';
 import type { User } from '@supabase/supabase-js';
 import { getCurrentUser, signInWithGoogle, signOutUser } from './lib/auth';
+import { recordGameRunToSupabase } from './lib/gameSync';
 import * as Application from 'expo-application';
 import {
   Alert,
@@ -269,7 +270,6 @@ export default function App() {
         if (savedSettings) setSettings(JSON.parse(savedSettings));
         if (savedFavs) setFavorites(JSON.parse(savedFavs));
 
-        // If logged in, fetch cloud favorites
         const currentUser = await getCurrentUser();
         if (currentUser) {
           const { data: cloudFavs } = await supabase
@@ -373,9 +373,10 @@ export default function App() {
     ]);
   }, [errors, mistakes, notes, values]);
 
+  const [hintsUsed, setHintsUsed] = useState(0);
+  
   const startNewGame = useCallback(
     (targetLayout: BoardLayout, targetDifficulty: Difficulty) => {
-      // Guaranteed solvable generator call
       const { puzzle, solution: solvedBoard } = generate(
         targetLayout,
         targetDifficulty,
@@ -390,6 +391,7 @@ export default function App() {
       setNotes(emptyNotes(targetLayout.size));
       setSelected(null);
       setMistakes(0);
+      setHintsUsed(0);
       setTimerSeconds(0);
       setIsGameOver(false);
       setIsWon(false);
@@ -461,35 +463,6 @@ export default function App() {
     setScreen('game');
   };
 
-  // Cloud Sync for Game Runs (Win/Loss)
-  async function recordGameRunToSupabase(run: {
-    gridSize: number;
-    difficulty: string;
-    timeSeconds: number;
-    mistakes: number;
-    hintsUsed: number;
-    status: 'won' | 'lost';
-  }) {
-    try {
-      const { data: { user: activeUser } } = await supabase.auth.getUser();
-
-      await supabase.from('game_runs').insert([
-        {
-          user_id: activeUser?.id ?? null,
-          device_id: deviceId,
-          grid_size: run.gridSize,
-          difficulty: run.difficulty.toLowerCase(),
-          time_seconds: run.timeSeconds,
-          mistakes: run.mistakes,
-          hints_used: run.hintsUsed,
-          status: run.status,
-        },
-      ]);
-    } catch (err) {
-      console.error('Failed to record run to Supabase:', err);
-    }
-  }
-
   const recordWin = useCallback(
     async (finalTime: number) => {
       setIsWon(true);
@@ -520,8 +493,9 @@ export default function App() {
         difficulty: difficulty,
         timeSeconds: finalTime,
         mistakes: mistakes,
-        hintsUsed: 0,
+        hintsUsed: hintsUsed,
         status: 'won',
+        deviceId: deviceId,
       });
 
       Alert.alert(
@@ -547,6 +521,7 @@ export default function App() {
       mistakes: mistakes,
       hintsUsed: 0,
       status: 'lost',
+      deviceId: deviceId,
     });
   }, [difficulty, layout.size, mistakes, timerSeconds, deviceId]);
 
@@ -605,6 +580,7 @@ export default function App() {
   }, [history, isGameOver, isPaused, isWon]);
 
   const onHint = useCallback(() => {
+    setHintsUsed(hintsUsed + 1);
     if (selected == null || isGameOver || isWon || isPaused) return;
     const { row, col } = selected;
     if (initialClues[row]?.[col]) return;
