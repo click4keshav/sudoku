@@ -3,6 +3,7 @@ import { Pressable, StyleSheet, Text, View } from 'react-native';
 type KeypadProps = {
   size: number;
   notesMode: boolean;
+  selectedDigit: number | null;
   remainingCounts: Record<number, number>;
   canUndo: boolean;
   onNotesModeChange: (value: boolean) => void;
@@ -15,6 +16,7 @@ type KeypadProps = {
 export default function Keypad({
   size,
   notesMode,
+  selectedDigit,
   remainingCounts,
   canUndo,
   onNotesModeChange,
@@ -27,7 +29,6 @@ export default function Keypad({
 
   return (
     <View style={styles.wrap}>
-      {/* 4 Action Helper Buttons */}
       <View style={styles.actions}>
         <Pressable
           onPress={onUndo}
@@ -81,11 +82,11 @@ export default function Keypad({
         </Pressable>
       </View>
 
-      {/* Number Pad with Remaining Count Badges */}
       <View style={styles.digits}>
         {digits.map((digit) => {
           const remaining = remainingCounts[digit] ?? size;
           const isDone = remaining <= 0;
+          const isLocked = selectedDigit === digit;
 
           return (
             <Pressable
@@ -94,16 +95,29 @@ export default function Keypad({
               disabled={isDone}
               style={({ pressed }) => [
                 styles.digit,
+                isLocked && styles.digitLocked,
                 isDone && styles.digitDone,
                 pressed && !isDone && styles.pressed,
               ]}
               accessibilityRole="button"
               accessibilityLabel={`Number ${digit}, ${remaining} left`}
             >
-              <Text style={[styles.digitLabel, isDone && styles.digitLabelDone]}>
+              <Text
+                style={[
+                  styles.digitLabel,
+                  isLocked && styles.digitLabelLocked,
+                  isDone && styles.digitLabelDone,
+                ]}
+              >
                 {digit}
               </Text>
-              <Text style={[styles.remainingLabel, isDone && styles.remainingLabelDone]}>
+              <Text
+                style={[
+                  styles.remainingLabel,
+                  isLocked && styles.remainingLabelLocked,
+                  isDone && styles.remainingLabelDone,
+                ]}
+              >
                 {isDone ? '✓' : remaining}
               </Text>
             </Pressable>
@@ -179,6 +193,11 @@ const styles = StyleSheet.create({
     borderColor: '#D1D5DB',
     backgroundColor: '#F9FAFB',
   },
+  digitLocked: {
+    borderColor: '#0284C7',
+    borderWidth: 2,
+    backgroundColor: '#E0F2FE',
+  },
   digitDone: {
     backgroundColor: '#E5E7EB',
     borderColor: '#E5E7EB',
@@ -190,6 +209,9 @@ const styles = StyleSheet.create({
     fontWeight: '700',
     color: '#111827',
   },
+  digitLabelLocked: {
+    color: '#0369A1',
+  },
   digitLabelDone: {
     color: '#9CA3AF',
   },
@@ -198,6 +220,9 @@ const styles = StyleSheet.create({
     fontWeight: '600',
     color: '#6B7280',
     marginTop: 1,
+  },
+  remainingLabelLocked: {
+    color: '#0284C7',
   },
   remainingLabelDone: {
     color: '#9CA3AF',

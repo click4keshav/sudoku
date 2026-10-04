@@ -37,6 +37,7 @@ import {
     errors: boolean[][];
     notes: NotesGrid;
     selected: SelectedCell | null;
+    hintHighlightCell?: SelectedCell | null;
     isPaused: boolean;
     theme: ThemeColors;
     onResume: () => void;
@@ -50,6 +51,7 @@ import {
     errors,
     notes,
     selected,
+    hintHighlightCell,
     isPaused,
     theme,
     onResume,
@@ -91,6 +93,10 @@ import {
                       const isClue = initialClues[row]?.[col];
                       const isError = errors[row]?.[col];
   
+                      const isHintCell =
+                        hintHighlightCell?.row === row &&
+                        hintHighlightCell?.col === col;
+  
                       const isRowOrCol =
                         selected != null &&
                         (selected.row === row || selected.col === col);
@@ -105,6 +111,7 @@ import {
                       if (isSameNumber) bg = theme.matchBg;
                       if (isSelected) bg = theme.selectedBg;
                       if (isError) bg = theme.errorBg;
+                      if (isHintCell) bg = '#FEF08A';
   
                       return (
                         <Pressable
@@ -125,7 +132,9 @@ import {
                                 isClue
                                   ? { color: theme.clueText, fontWeight: '800' }
                                   : { color: theme.userText, fontWeight: '700' },
-                                isError ? { color: theme.errorText, fontWeight: '800' } : null,
+                                isError
+                                  ? { color: theme.errorText, fontWeight: '800' }
+                                  : null,
                               ]}
                             >
                               {value}
@@ -249,16 +258,16 @@ import {
       fontWeight: '600' as const,
     },
     pausedOverlay: {
-        position: 'absolute',
-        top: 0,
-        left: 0,
-        right: 0,
-        bottom: 0,
-        alignItems: 'center',
-        justifyContent: 'center',
-        gap: 8,
-        zIndex: 10,
-      },
+      position: 'absolute',
+      top: 0,
+      left: 0,
+      right: 0,
+      bottom: 0,
+      alignItems: 'center',
+      justifyContent: 'center',
+      gap: 8,
+      zIndex: 10,
+    },
     pausedIcon: {
       fontSize: 36,
     },

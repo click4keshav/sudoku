@@ -4,8 +4,19 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { supabase } from './lib/supabase';
 import type { User } from '@supabase/supabase-js';
 import { getCurrentUser, signInWithGoogle, signOutUser } from './lib/auth';
-import { recordGameRunToSupabase, syncUserDataUponLogin } from './lib/gameSync';
+import {
+  recordGameRunToSupabase,
+  syncUserDataUponLogin,
+  fetchUserStatsFromCloud,
+  syncActiveGameToCloud,
+  clearActiveGameFromCloud,
+  STATS_KEY,
+} from './lib/gameSync';
 import * as Application from 'expo-application';
+import {
+  SafeAreaProvider,
+  useSafeAreaInsets,
+} from 'react-native-safe-area-context';
 import {
   Alert,
   Image,
@@ -33,7 +44,6 @@ import {
 import { generate, type Difficulty } from './lib/gameLogic';
 
 const STORAGE_KEY = '@sudoku_save_v4';
-const STATS_KEY = '@sudoku_stats_v4';
 const FAVORITES_KEY = '@sudoku_favorites_v4';
 const SETTINGS_KEY = '@sudoku_settings_v4';
 
@@ -69,14 +79,31 @@ type SavedGameItem = {
 
 type AppSettings = {
   limitMistakes: boolean;
+  autoRemoveNotes: boolean;
+  autoCheckErrors: boolean;
+  highlightDuplicates: boolean;
+  fastInputMode: boolean;
+  showTimer: boolean;
   themeMode: 'light' | 'dark';
   accentTheme: 'classic' | 'sepia' | 'slate' | 'navy';
 };
 
 const DEFAULT_SETTINGS: AppSettings = {
   limitMistakes: true,
+  autoRemoveNotes: true,
+  autoCheckErrors: true,
+  highlightDuplicates: true,
+  fastInputMode: false,
+  showTimer: true,
   themeMode: 'light',
   accentTheme: 'classic',
+};
+
+type SmartHint = {
+  row: number;
+  col: number;
+  value: number;
+  reason: string;
 };
 
 function emptyNotes(size: number): NotesGrid {
@@ -107,18 +134,20 @@ function formatTime(seconds: number): string {
   return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
 }
 
-export default function App() {
+function MainApp() {
+  const insets = useSafeAreaInsets();
+
   const [tab, setTab] = useState<'home' | 'stats' | 'profile'>('home');
   const [screen, setScreen] = useState<'home' | 'game'>('home');
   const [favoritesOpen, setFavoritesOpen] = useState(false);
   const [themeModalOpen, setThemeModalOpen] = useState(false);
   const [settingsModalOpen, setSettingsModalOpen] = useState(false);
+  const [rulesModalOpen, setRulesModalOpen] = useState(false);
 
   const [settings, setSettings] = useState<AppSettings>(DEFAULT_SETTINGS);
   const [layout, setLayout] = useState<BoardLayout>(DEFAULT_BOARD_LAYOUT);
   const [difficulty, setDifficulty] = useState<Difficulty>('medium');
 
-  // Dedicated picker states for the Home screen selection
   const [pickerLayout, setPickerLayout] = useState<BoardLayout>(DEFAULT_BOARD_LAYOUT);
   const [pickerDifficulty, setPickerDifficulty] = useState<Difficulty>('medium');
 
@@ -129,15 +158,20 @@ export default function App() {
   const [errors, setErrors] = useState<boolean[][]>([]);
   const [notes, setNotes] = useState<NotesGrid>([]);
   const [selected, setSelected] = useState<SelectedCell | null>(null);
+  const [lockedDigit, setLockedDigit] = useState<number | null>(null);
   const [notesMode, setNotesMode] = useState(false);
   const [isPaused, setIsPaused] = useState(false);
   const [history, setHistory] = useState<MoveSnapshot[]>([]);
+
+  const [activeHint, setActiveHint] = useState<SmartHint | null>(null);
 
   const [mistakes, setMistakes] = useState(0);
   const [hintsUsed, setHintsUsed] = useState(0);
   const [timerSeconds, setTimerSeconds] = useState(0);
   const [isGameOver, setIsGameOver] = useState(false);
   const [isWon, setIsWon] = useState(false);
+  const [isAutoSolved, setIsAutoSolved] = useState(false);
+
   const [stats, setStats] = useState<AllStats>({});
   const [favorites, setFavorites] = useState<SavedGameItem[]>([]);
   const [hasSavedGame, setHasSavedGame] = useState(false);
@@ -148,7 +182,6 @@ export default function App() {
   const [authLoading, setAuthLoading] = useState(false);
   const [deviceId, setDeviceId] = useState<string>('guest-device');
 
-  // Fetch Android Advertising ID (AAID)
   useEffect(() => {
     async function getAAID() {
       try {
@@ -247,19 +280,41 @@ export default function App() {
     };
   }, [isDark, settings.accentTheme]);
 
-  const streakKey = `${layout.label} - ${difficulty.toUpperCase()}`;
+  const refreshStats = useCallback(async () => {
+    const freshStats = await fetchUserStatsFromCloud();
+    if (freshStats) {
+      setStats(freshStats);
+    }
+  }, []);
+
+  const restoreActiveGamePayload = useCallback((p: any) => {
+    if (!p || !p.values || p.values.length === 0) return;
+    setGameId(p.gameId || Date.now().toString());
+    setLayout(p.layout);
+    setDifficulty(p.difficulty);
+    setValues(p.values);
+    setSolution(p.solution);
+    setInitialClues(p.initialClues);
+    setErrors(p.errors || emptyErrors(p.layout.size));
+    setNotes(p.notes || emptyNotes(p.layout.size));
+    setMistakes(p.mistakes || 0);
+    setTimerSeconds(p.timerSeconds || 0);
+    setIsGameOver(false);
+    setIsWon(false);
+    setIsAutoSolved(false);
+    setHistory(p.history || []);
+    setHasSavedGame(true);
+  }, []);
 
   useEffect(() => {
     getCurrentUser().then((u) => {
       setUser(u);
       if (u) {
         syncUserDataUponLogin(
-          (cloudStats) => {
-            console.log('📊 Stats synchronized on boot:', cloudStats);
-          },
-          (remoteFavorites) => {
-            setFavorites(remoteFavorites);
-          },
+          deviceId,
+          (cloudStats) => cloudStats && setStats(cloudStats),
+          (remoteFavorites) => setFavorites(remoteFavorites),
+          (remoteActiveGame) => restoreActiveGamePayload(remoteActiveGame),
         );
       }
     });
@@ -267,25 +322,19 @@ export default function App() {
     const { data: { subscription } } = supabase.auth.onAuthStateChange(async (_event, session) => {
       const currentUser = session?.user ?? null;
       setUser(currentUser);
-
       if (currentUser) {
         await syncUserDataUponLogin(
-          (cloudStats) => {
-            console.log('📊 Stats synchronized on login:', cloudStats);
-          },
-          (remoteFavorites) => {
-            setFavorites(remoteFavorites);
-          },
+          deviceId,
+          (cloudStats) => cloudStats && setStats(cloudStats),
+          (remoteFavorites) => setFavorites(remoteFavorites),
+          (remoteActiveGame) => restoreActiveGamePayload(remoteActiveGame),
         );
       }
     });
 
-    return () => {
-      subscription.unsubscribe();
-    };
-  }, []);
+    return () => subscription.unsubscribe();
+  }, [deviceId, restoreActiveGamePayload]);
 
-  // Load state & cloud favorites/stats
   useEffect(() => {
     async function loadData() {
       try {
@@ -303,31 +352,12 @@ export default function App() {
 
         const currentUser = await getCurrentUser();
         if (currentUser) {
-          const { data: cloudFavs } = await supabase
-            .from('user_favorites')
-            .select('*')
-            .eq('user_id', currentUser.id);
-          if (cloudFavs && cloudFavs.length > 0) {
-            setFavorites(cloudFavs.map((f: any) => f.game_payload));
-          }
+          await refreshStats();
         }
 
         if (savedGame != null) {
           const p = JSON.parse(savedGame);
-          setGameId(p.gameId || Date.now().toString());
-          setLayout(p.layout);
-          setDifficulty(p.difficulty);
-          setValues(p.values);
-          setSolution(p.solution);
-          setInitialClues(p.initialClues);
-          setErrors(p.errors);
-          setNotes(p.notes);
-          setMistakes(p.mistakes);
-          setTimerSeconds(p.timerSeconds);
-          setIsGameOver(p.isGameOver || false);
-          setIsWon(p.isWon || false);
-          setHistory(p.history || []);
-          setHasSavedGame(p.values?.length > 0 && !p.isGameOver && !p.isWon);
+          restoreActiveGamePayload(p);
         }
       } catch (err) {
         console.warn('Load err:', err);
@@ -337,20 +367,20 @@ export default function App() {
       }
     }
     loadData();
-  }, [user]);
+  }, [refreshStats, restoreActiveGamePayload]);
 
-  // Timer interval
   useEffect(() => {
-    if (screen !== 'game' || isPaused || isGameOver || isWon) return;
+    if (screen !== 'game' || isPaused || isGameOver || isWon || isAutoSolved) return;
     const timer = setInterval(() => {
       setTimerSeconds((prev) => prev + 1);
     }, 1000);
     return () => clearInterval(timer);
-  }, [screen, isPaused, isGameOver, isWon]);
+  }, [screen, isPaused, isGameOver, isWon, isAutoSolved]);
 
-  // Save game continuously
   useEffect(() => {
     if (!isLoadedRef.current || values.length === 0) return;
+
+    const isOngoing = !isGameOver && !isWon && !isAutoSolved;
     const state = {
       gameId,
       layout,
@@ -364,10 +394,21 @@ export default function App() {
       timerSeconds,
       isGameOver,
       isWon,
+      isAutoSolved,
       history,
     };
+
     AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(state)).catch(() => {});
-    setHasSavedGame(!isGameOver && !isWon);
+    setHasSavedGame(isOngoing);
+
+    if (isOngoing && user) {
+      const handler = setTimeout(() => {
+        syncActiveGameToCloud(state);
+      }, 800);
+      return () => clearTimeout(handler);
+    } else if (!isOngoing && user) {
+      clearActiveGameFromCloud();
+    }
   }, [
     gameId,
     layout,
@@ -381,7 +422,9 @@ export default function App() {
     timerSeconds,
     isGameOver,
     isWon,
+    isAutoSolved,
     history,
+    user,
   ]);
 
   const updateSettings = (newSettings: Partial<AppSettings>) => {
@@ -422,28 +465,53 @@ export default function App() {
       setErrors(emptyErrors(targetLayout.size));
       setNotes(emptyNotes(targetLayout.size));
       setSelected(null);
+      setLockedDigit(null);
+      setActiveHint(null);
       setMistakes(0);
       setHintsUsed(0);
       setTimerSeconds(0);
       setIsGameOver(false);
       setIsWon(false);
+      setIsAutoSolved(false);
       setIsPaused(false);
       setHistory([]);
       setScreen('game');
-
-      const key = `${targetLayout.label} - ${targetDifficulty.toUpperCase()}`;
-      setStats((prev) => {
-        const cur = prev[key] || { started: 0, won: 0, bestTime: null, streak: 0 };
-        const updated = {
-          ...prev,
-          [key]: { ...cur, started: cur.started + 1 },
-        };
-        AsyncStorage.setItem(STATS_KEY, JSON.stringify(updated)).catch(() => {});
-        return updated;
-      });
     },
     [],
   );
+
+  const restartCurrentGame = useCallback(() => {
+    Alert.alert(
+      'Restart Puzzle',
+      'Are you sure you want to clear all moves and restart this board?',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Restart',
+          style: 'destructive',
+          onPress: () => {
+            const freshBoard = solution.map((row, r) =>
+              row.map((val, c) => (initialClues[r]?.[c] ? val : null)),
+            );
+            setValues(freshBoard);
+            setErrors(emptyErrors(layout.size));
+            setNotes(emptyNotes(layout.size));
+            setMistakes(0);
+            setHintsUsed(0);
+            setTimerSeconds(0);
+            setIsGameOver(false);
+            setIsWon(false);
+            setIsAutoSolved(false);
+            setIsPaused(false);
+            setSelected(null);
+            setLockedDigit(null);
+            setActiveHint(null);
+            setHistory([]);
+          },
+        },
+      ],
+    );
+  }, [initialClues, layout.size, solution]);
 
   const isCurrentFavorite = favorites.some((f) => f.id === gameId);
   const toggleFavoriteCurrentGame = async () => {
@@ -470,7 +538,7 @@ export default function App() {
       updated = [item, ...favorites];
       if (user) {
         await supabase.from('user_favorites').insert([
-          { user_id: user.id, game_id: gameId, game_payload: item }
+          { user_id: user.id, game_id: gameId, game_payload: item },
         ]);
       }
     }
@@ -491,71 +559,77 @@ export default function App() {
     setTimerSeconds(item.timerSeconds);
     setIsGameOver(false);
     setIsWon(false);
+    setIsAutoSolved(false);
     setFavoritesOpen(false);
     setScreen('game');
   };
 
   const recordWin = useCallback(
-    async (finalTime: number) => {
+    async (finalTime: number, totalMistakes: number) => {
+      if (isAutoSolved) return;
+
       setIsWon(true);
       setHasSavedGame(false);
-      const cur = stats[streakKey] || {
-        started: 1,
-        won: 0,
-        bestTime: null,
-        streak: 0,
-      };
-      const updated: AllStats = {
-        ...stats,
-        [streakKey]: {
-          started: Math.max(cur.started, cur.won + 1),
-          won: cur.won + 1,
-          bestTime:
-            cur.bestTime == null
-              ? finalTime
-              : Math.min(cur.bestTime, finalTime),
-          streak: cur.streak + 1,
-        },
-      };
-      setStats(updated);
-      await AsyncStorage.setItem(STATS_KEY, JSON.stringify(updated));
+      clearActiveGameFromCloud();
 
-      await recordGameRunToSupabase({
+      const res = await recordGameRunToSupabase({
         gridSize: layout.size,
         difficulty: difficulty,
         timeSeconds: finalTime,
-        mistakes: mistakes,
+        mistakes: totalMistakes,
         hintsUsed: hintsUsed,
         status: 'won',
         deviceId: deviceId,
       });
 
+      if (res?.localStats) {
+        setStats(res.localStats);
+      }
+
+      if (user) {
+        await refreshStats();
+      }
+
       Alert.alert(
         '🎉 Congratulations!',
-        `Puzzle solved in ${formatTime(finalTime)} with ${mistakes} mistake(s)!\n\nStreak: ${updated[streakKey].streak} | Best: ${formatTime(updated[streakKey].bestTime || finalTime)}`,
+        `Puzzle solved in ${formatTime(finalTime)} with ${totalMistakes} mistake(s)!`,
         [
           { text: 'Play Again', onPress: () => startNewGame(layout, difficulty) },
           { text: 'Home', onPress: () => setScreen('home') },
         ],
       );
     },
-    [difficulty, layout, mistakes, startNewGame, stats, streakKey, deviceId, hintsUsed],
+    [difficulty, isAutoSolved, layout, refreshStats, startNewGame, deviceId, hintsUsed, user],
   );
 
-  const recordLoss = useCallback(async (finalMistakes: number) => {
-    setIsGameOver(true);
-    setHasSavedGame(false);
-  
-    await recordGameRunToSupabase({
-      gridSize: layout.size,
-      difficulty: difficulty,
-      timeSeconds: timerSeconds,
-      mistakes: finalMistakes,
-      hintsUsed: hintsUsed,
-      status: 'lost',
-      deviceId: deviceId,
-    });
-  }, [difficulty, layout.size, timerSeconds, hintsUsed, deviceId]);
+  const recordLoss = useCallback(
+    async (finalMistakes: number) => {
+      if (isAutoSolved) return;
+
+      setIsGameOver(true);
+      setHasSavedGame(false);
+      clearActiveGameFromCloud();
+
+      const res = await recordGameRunToSupabase({
+        gridSize: layout.size,
+        difficulty: difficulty,
+        timeSeconds: timerSeconds,
+        mistakes: finalMistakes,
+        hintsUsed: hintsUsed,
+        status: 'lost',
+        deviceId: deviceId,
+      });
+
+      if (res?.localStats) {
+        setStats(res.localStats);
+      }
+
+      if (user) {
+        await refreshStats();
+      }
+    },
+    [difficulty, isAutoSolved, layout.size, refreshStats, timerSeconds, hintsUsed, deviceId, user],
+  );
 
   const remainingCounts = useMemo(() => {
     const counts: Record<number, number> = {};
@@ -573,92 +647,339 @@ export default function App() {
     return counts;
   }, [errors, layout.size, values]);
 
-  const clearSurroundingNotes = (
-    currentNotes: NotesGrid,
-    targetRow: number,
-    targetCol: number,
-    digit: number,
-  ): NotesGrid => {
-    const { boxRows, boxCols } = layout;
-    const startRow = Math.floor(targetRow / boxRows) * boxRows;
-    const startCol = Math.floor(targetCol / boxCols) * boxCols;
+  const isBoardFull = useMemo(() => {
+    if (values.length === 0) return false;
+    for (let r = 0; r < layout.size; r++) {
+      for (let c = 0; c < layout.size; c++) {
+        if (values[r]?.[c] == null) return false;
+      }
+    }
+    return true;
+  }, [layout.size, values]);
 
-    return currentNotes.map((noteRow, r) =>
-      noteRow.map((marks, c) => {
-        const inRow = r === targetRow;
-        const inCol = c === targetCol;
-        const inBox =
-          r >= startRow &&
-          r < startRow + boxRows &&
-          c >= startCol &&
-          c < startCol + boxCols;
+  const verifyCompletedBoard = useCallback(() => {
+    if (isAutoSolved) return;
 
-        if (inRow || inCol || inBox) {
-          return marks.map((on, idx) => (idx === digit - 1 ? false : on));
+    let wrongCount = 0;
+    const newErrors = emptyErrors(layout.size);
+
+    for (let r = 0; r < layout.size; r++) {
+      for (let c = 0; c < layout.size; c++) {
+        if (values[r][c] !== solution[r][c]) {
+          newErrors[r][c] = true;
+          wrongCount++;
         }
-        return marks;
-      }),
-    );
-  };
+      }
+    }
+
+    setErrors(newErrors);
+
+    if (wrongCount === 0) {
+      recordWin(timerSeconds, mistakes);
+    } else {
+      const finalMistakes = mistakes + wrongCount;
+      setMistakes(finalMistakes);
+      recordLoss(finalMistakes);
+      Alert.alert(
+        'Game Over',
+        `Puzzle verification failed! You had ${wrongCount} incorrect cell(s).`,
+        [
+          { text: 'Try Again', onPress: () => startNewGame(layout, difficulty) },
+          { text: 'Restart Board', onPress: restartCurrentGame },
+          { text: 'Home', onPress: () => setScreen('home') },
+        ],
+      );
+    }
+  }, [
+    difficulty,
+    isAutoSolved,
+    layout.size,
+    mistakes,
+    recordLoss,
+    recordWin,
+    restartCurrentGame,
+    solution,
+    startNewGame,
+    timerSeconds,
+    values,
+  ]);
+
+  const clearSurroundingNotes = useCallback(
+    (currentNotes: NotesGrid, targetRow: number, targetCol: number, digit: number): NotesGrid => {
+      const { size, boxRows, boxCols } = layout;
+      const numIdx = digit - 1;
+      const startRow = Math.floor(targetRow / boxRows) * boxRows;
+      const startCol = Math.floor(targetCol / boxCols) * boxCols;
+
+      return currentNotes.map((noteRow, r) =>
+        noteRow.map((marks, c) => {
+          if (r === targetRow && c === targetCol) {
+            return Array(size).fill(false);
+          }
+
+          const inRow = r === targetRow;
+          const inCol = c === targetCol;
+          const inBox =
+            r >= startRow &&
+            r < startRow + boxRows &&
+            c >= startCol &&
+            c < startCol + boxCols;
+
+          if (inRow || inCol || inBox) {
+            if (marks[numIdx]) {
+              const nextMarks = [...marks];
+              nextMarks[numIdx] = false;
+              return nextMarks;
+            }
+          }
+          return marks;
+        }),
+      );
+    },
+    [layout],
+  );
+
+  const computeConflictGrid = useCallback(
+    (grid: CellValue[][], row: number, col: number, digit: number): boolean[][] => {
+      const nextErrors = emptyErrors(layout.size);
+      const { boxRows, boxCols } = layout;
+      const startRow = Math.floor(row / boxRows) * boxRows;
+      const startCol = Math.floor(col / boxCols) * boxCols;
+
+      for (let c = 0; c < layout.size; c++) {
+        if (c !== col && grid[row][c] === digit) {
+          nextErrors[row][c] = true;
+          nextErrors[row][col] = true;
+        }
+      }
+
+      for (let r = 0; r < layout.size; r++) {
+        if (r !== row && grid[r][col] === digit) {
+          nextErrors[r][col] = true;
+          nextErrors[row][col] = true;
+        }
+      }
+
+      for (let r = 0; r < boxRows; r++) {
+        for (let c = 0; c < boxCols; c++) {
+          const br = startRow + r;
+          const bc = startCol + c;
+          if ((br !== row || bc !== col) && grid[br][bc] === digit) {
+            nextErrors[br][bc] = true;
+            nextErrors[row][col] = true;
+          }
+        }
+      }
+
+      return nextErrors;
+    },
+    [layout],
+  );
+
+  const executeDigitInput = useCallback(
+    (targetRow: number, targetCol: number, digit: number) => {
+      if (initialClues[targetRow]?.[targetCol] || isGameOver || isWon || isPaused || isAutoSolved) return;
+
+      pushHistory();
+
+      if (notesMode) {
+        if (values[targetRow][targetCol] != null) return;
+        setNotes((current) =>
+          current.map((noteRow, r) =>
+            noteRow.map((marks, c) =>
+              r === targetRow && c === targetCol
+                ? marks.map((on, index) => (index === digit - 1 ? !on : on))
+                : marks,
+            ),
+          ),
+        );
+        return;
+      }
+
+      const isCorrect = solution[targetRow]?.[targetCol] === digit;
+
+      if (settings.autoCheckErrors) {
+        const nextMistakes = isCorrect ? mistakes : mistakes + 1;
+
+        if (!isCorrect) {
+          setMistakes(nextMistakes);
+          if (settings.limitMistakes && nextMistakes >= 3) {
+            recordLoss(nextMistakes);
+            Alert.alert(
+              'Game Over',
+              'You made 3 mistakes. Better luck next time!',
+              [
+                { text: 'Try Again', onPress: () => startNewGame(layout, difficulty) },
+                { text: 'Restart Board', onPress: restartCurrentGame },
+                { text: 'Home', onPress: () => setScreen('home') },
+              ],
+            );
+          }
+        }
+      }
+
+      const nextValues = values.map((valRow, r) =>
+        valRow.map((v, c) => (r === targetRow && c === targetCol ? digit : v)),
+      );
+      setValues(nextValues);
+
+      let nextErrors = emptyErrors(layout.size);
+      if (settings.highlightDuplicates) {
+        nextErrors = computeConflictGrid(nextValues, targetRow, targetCol, digit);
+      }
+      if (settings.autoCheckErrors && !isCorrect) {
+        nextErrors[targetRow][targetCol] = true;
+      }
+      setErrors(nextErrors);
+
+      if (isCorrect && settings.autoRemoveNotes) {
+        setNotes((curNotes) => clearSurroundingNotes(curNotes, targetRow, targetCol, digit));
+      }
+
+      if (settings.autoCheckErrors && isCorrect) {
+        let isComplete = true;
+        for (let r = 0; r < layout.size; r++) {
+          for (let c = 0; c < layout.size; c++) {
+            if (nextValues[r]?.[c] !== solution[r]?.[c]) {
+              isComplete = false;
+              break;
+            }
+          }
+          if (!isComplete) break;
+        }
+        if (isComplete) recordWin(timerSeconds, mistakes);
+      }
+    },
+    [
+      clearSurroundingNotes,
+      computeConflictGrid,
+      difficulty,
+      initialClues,
+      isAutoSolved,
+      isGameOver,
+      isPaused,
+      isWon,
+      layout,
+      mistakes,
+      notesMode,
+      pushHistory,
+      recordLoss,
+      recordWin,
+      restartCurrentGame,
+      settings.autoCheckErrors,
+      settings.autoRemoveNotes,
+      settings.highlightDuplicates,
+      settings.limitMistakes,
+      solution,
+      startNewGame,
+      timerSeconds,
+      values,
+    ],
+  );
+
+  const handleSelectCell = useCallback(
+    (cell: SelectedCell) => {
+      setSelected(cell);
+      if (settings.fastInputMode && lockedDigit != null) {
+        executeDigitInput(cell.row, cell.col, lockedDigit);
+      }
+    },
+    [executeDigitInput, lockedDigit, settings.fastInputMode],
+  );
+
+  const handleKeypadDigit = useCallback(
+    (digit: number) => {
+      if (settings.fastInputMode) {
+        setLockedDigit((prev) => (prev === digit ? null : digit));
+      } else {
+        if (selected != null) {
+          executeDigitInput(selected.row, selected.col, digit);
+        }
+      }
+    },
+    [executeDigitInput, selected, settings.fastInputMode],
+  );
+
+  const requestSmartHint = useCallback(() => {
+    if (isGameOver || isWon || isPaused || isAutoSolved) return;
+
+    for (let r = 0; r < layout.size; r++) {
+      for (let c = 0; c < layout.size; c++) {
+        if (values[r][c] == null && !initialClues[r][c]) {
+          const correctVal = solution[r][c]!;
+          setActiveHint({
+            row: r,
+            col: c,
+            value: correctVal,
+            reason: `In Row ${r + 1}, Column ${c + 1}, placing ${correctVal} satisfies all surrounding grid and block constraints.`,
+          });
+          setSelected({ row: r, col: c });
+          return;
+        }
+      }
+    }
+  }, [initialClues, isAutoSolved, isGameOver, isPaused, isWon, layout.size, solution, values]);
+
+  const applyActiveSmartHint = useCallback(() => {
+    if (!activeHint) return;
+    setHintsUsed((prev) => prev + 1);
+    executeDigitInput(activeHint.row, activeHint.col, activeHint.value);
+    setActiveHint(null);
+  }, [activeHint, executeDigitInput]);
 
   const onUndo = useCallback(() => {
-    if (history.length === 0 || isGameOver || isWon || isPaused) return;
+    if (history.length === 0 || isGameOver || isWon || isPaused || isAutoSolved) return;
     const previous = history[history.length - 1];
     setValues(previous.values);
     setNotes(previous.notes);
     setErrors(previous.errors);
     setMistakes(previous.mistakes);
     setHistory((prev) => prev.slice(0, -1));
-  }, [history, isGameOver, isPaused, isWon]);
+  }, [history, isAutoSolved, isGameOver, isPaused, isWon]);
 
-  const onHint = useCallback(() => {
-    if (selected == null || isGameOver || isWon || isPaused) return;
+  const onErase = useCallback(() => {
+    if (selected == null || isGameOver || isWon || isPaused || isAutoSolved) return;
     const { row, col } = selected;
     if (initialClues[row]?.[col]) return;
-    if (values[row]?.[col] === solution[row]?.[col]) return;
 
-    setHintsUsed((prev) => prev + 1);
     pushHistory();
-    const correctVal = solution[row][col]!;
-
-    const nextValues = values.map((rArr, r) =>
-      rArr.map((v, c) => (r === row && c === col ? correctVal : v)),
-    );
-    setValues(nextValues);
-
-    setErrors((current) =>
+    setValues((current) =>
       current.map((rArr, r) =>
-        rArr.map((e, c) => (r === row && c === col ? false : e)),
+        rArr.map((val, c) => (r === row && c === col ? null : val)),
       ),
     );
+    setErrors((current) =>
+      current.map((rArr, r) =>
+        rArr.map((err, c) => (r === row && c === col ? false : err)),
+      ),
+    );
+  }, [initialClues, isAutoSolved, isGameOver, isPaused, isWon, pushHistory, selected]);
 
-    setNotes((curNotes) => clearSurroundingNotes(curNotes, row, col, correctVal));
-
-    let isComplete = true;
-    for (let r = 0; r < layout.size; r++) {
-      for (let c = 0; c < layout.size; c++) {
-        if (nextValues[r]?.[c] !== solution[r]?.[c]) {
-          isComplete = false;
-          break;
-        }
-      }
-      if (!isComplete) break;
-    }
-    if (isComplete) recordWin(timerSeconds);
-  }, [
-    clearSurroundingNotes,
-    initialClues,
-    isGameOver,
-    isPaused,
-    isWon,
-    layout.size,
-    pushHistory,
-    recordWin,
-    selected,
-    solution,
-    timerSeconds,
-    values,
-  ]);
+  const onSolveBoard = useCallback(() => {
+    if (solution.length === 0 || isGameOver || isWon || isAutoSolved) return;
+    Alert.alert(
+      'Reveal Solution?',
+      'Solving the board automatically allows you to inspect the solution, but will not count towards your stats, win count, or records.',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Reveal Solution',
+          style: 'destructive',
+          onPress: () => {
+            setIsAutoSolved(true);
+            setIsGameOver(true);
+            setHasSavedGame(false);
+            setValues(solution);
+            setErrors(emptyErrors(layout.size));
+            setNotes(emptyNotes(layout.size));
+            setSelected(null);
+            setLockedDigit(null);
+            setActiveHint(null);
+          },
+        },
+      ],
+    );
+  }, [isAutoSolved, isGameOver, isWon, layout.size, solution]);
 
   const handleAuthAction = async () => {
     if (user) {
@@ -687,125 +1008,6 @@ export default function App() {
       }
     }
   };
-
-  const onDigit = useCallback(
-    (digit: number) => {
-      if (selected == null || isGameOver || isWon || isPaused) return;
-      const { row, col } = selected;
-
-      if (initialClues[row]?.[col]) return;
-      if (values[row]?.[col] === digit) return;
-
-      pushHistory();
-
-      if (notesMode) {
-        if (values[row][col] != null) return;
-        setNotes((current) =>
-          current.map((noteRow, r) =>
-            noteRow.map((marks, c) =>
-              r === row && c === col
-                ? marks.map((on, index) => (index === digit - 1 ? !on : on))
-                : marks,
-            ),
-          ),
-        );
-        return;
-      }
-
-      const isCorrect = solution[row]?.[col] === digit;
-      const nextMistakes = isCorrect ? mistakes : mistakes + 1;
-
-      if (!isCorrect) {
-        setMistakes(nextMistakes);
-        if (settings.limitMistakes && nextMistakes >= 3) {
-          recordLoss(nextMistakes);
-          Alert.alert(
-            'Game Over',
-            'You made 3 mistakes. Better luck next time!',
-            [
-              { text: 'Try Again', onPress: () => startNewGame(layout, difficulty) },
-              { text: 'Home', onPress: () => setScreen('home') },
-            ],
-          );
-        }
-      }
-
-      const nextValues = values.map((valRow, r) =>
-        valRow.map((v, c) => (r === row && c === col ? digit : v)),
-      );
-      setValues(nextValues);
-
-      setErrors((current) =>
-        current.map((errRow, r) =>
-          errRow.map((err, c) => (r === row && c === col ? !isCorrect : err)),
-        ),
-      );
-
-      if (isCorrect) {
-        setNotes((curNotes) => clearSurroundingNotes(curNotes, row, col, digit));
-      }
-
-      if (isCorrect) {
-        let isComplete = true;
-        for (let r = 0; r < layout.size; r++) {
-          for (let c = 0; c < layout.size; c++) {
-            if (nextValues[r]?.[c] !== solution[r]?.[c]) {
-              isComplete = false;
-              break;
-            }
-          }
-          if (!isComplete) break;
-        }
-        if (isComplete) recordWin(timerSeconds);
-      }
-    },
-    [
-      clearSurroundingNotes,
-      difficulty,
-      initialClues,
-      isGameOver,
-      isPaused,
-      isWon,
-      layout,
-      mistakes,
-      notesMode,
-      pushHistory,
-      recordLoss,
-      recordWin,
-      selected,
-      settings.limitMistakes,
-      solution,
-      startNewGame,
-      timerSeconds,
-      values,
-    ],
-  );
-
-  const onErase = useCallback(() => {
-    if (selected == null || isGameOver || isWon || isPaused) return;
-    const { row, col } = selected;
-    if (initialClues[row]?.[col]) return;
-
-    pushHistory();
-    setValues((current) =>
-      current.map((rArr, r) =>
-        rArr.map((val, c) => (r === row && c === col ? null : val)),
-      ),
-    );
-    setErrors((current) =>
-      current.map((rArr, r) =>
-        rArr.map((err, c) => (r === row && c === col ? false : err)),
-      ),
-    );
-  }, [initialClues, isGameOver, isPaused, isWon, pushHistory, selected]);
-
-  const onSolveBoard = useCallback(() => {
-    if (solution.length === 0 || isGameOver || isWon) return;
-    setValues(solution);
-    setErrors(emptyErrors(layout.size));
-    setNotes(emptyNotes(layout.size));
-    setSelected(null);
-  }, [isGameOver, isWon, layout.size, solution]);
 
   const handleBackPress = () => {
     Alert.alert(
@@ -847,6 +1049,13 @@ export default function App() {
                   </Text>
                 </Pressable>
                 <Pressable
+                  onPress={() => setRulesModalOpen(true)}
+                  style={styles.iconCircle}
+                  accessibilityLabel="Rules and How to play"
+                >
+                  <Text style={styles.iconCircleText}>?</Text>
+                </Pressable>
+                <Pressable
                   onPress={() => setThemeModalOpen(true)}
                   style={styles.iconCircle}
                   accessibilityLabel="Theme options"
@@ -865,28 +1074,45 @@ export default function App() {
 
             <View style={styles.statsRow}>
               <Text style={[styles.statText, { color: theme.textSecondary }]}>
-                Mistakes:{' '}
-                {settings.limitMistakes ? `${mistakes}/3` : `${mistakes} (no limit)`}
+                {isAutoSolved
+                  ? 'Revealed (Practice)'
+                  : settings.autoCheckErrors
+                  ? `Mistakes: ${settings.limitMistakes ? `${mistakes}/3` : mistakes}`
+                  : 'Mode: Unguided'}
               </Text>
               <Pressable
-                onPress={() => setIsPaused(!isPaused)}
-                style={[styles.pauseButton, { backgroundColor: theme.cardBg }]}
+                onPress={restartCurrentGame}
+                style={[styles.smallActionBtn, { backgroundColor: theme.cardBg }]}
               >
-                <Text style={[styles.pauseButtonText, { color: theme.textPrimary }]}>
-                  {isPaused ? '▶ Play' : '⏸ Pause'}
+                <Text style={[styles.smallActionText, { color: theme.textPrimary }]}>
+                  🔄 Restart
                 </Text>
               </Pressable>
-              <Pressable
-                onPress={onSolveBoard}
-                style={[styles.solveButton, { backgroundColor: theme.cardBg }]}
-              >
-                <Text style={[styles.solveButtonText, { color: theme.textSecondary }]}>
-                  Solve
+              {!isAutoSolved && (
+                <Pressable
+                  onPress={() => setIsPaused(!isPaused)}
+                  style={[styles.smallActionBtn, { backgroundColor: theme.cardBg }]}
+                >
+                  <Text style={[styles.smallActionText, { color: theme.textPrimary }]}>
+                    {isPaused ? '▶ Play' : '⏸ Pause'}
+                  </Text>
+                </Pressable>
+              )}
+              {!isAutoSolved && (
+                <Pressable
+                  onPress={onSolveBoard}
+                  style={[styles.smallActionBtn, { backgroundColor: theme.cardBg }]}
+                >
+                  <Text style={[styles.smallActionText, { color: theme.textSecondary }]}>
+                    Solve
+                  </Text>
+                </Pressable>
+              )}
+              {settings.showTimer && (
+                <Text style={[styles.statText, { color: theme.textSecondary }]}>
+                  {formatTime(timerSeconds)}
                 </Text>
-              </Pressable>
-              <Text style={[styles.statText, { color: theme.textSecondary }]}>
-                {formatTime(timerSeconds)}
-              </Text>
+              )}
             </View>
           </View>
 
@@ -897,23 +1123,47 @@ export default function App() {
             errors={errors}
             notes={notes}
             selected={selected}
+            hintHighlightCell={activeHint ? { row: activeHint.row, col: activeHint.col } : null}
             isPaused={isPaused}
             theme={theme}
             onResume={() => setIsPaused(false)}
-            onSelectCell={setSelected}
+            onSelectCell={handleSelectCell}
           />
 
-          <Keypad
-            size={layout.size}
-            notesMode={notesMode}
-            remainingCounts={remainingCounts}
-            canUndo={history.length > 0}
-            onNotesModeChange={setNotesMode}
-            onDigit={onDigit}
-            onErase={onErase}
-            onUndo={onUndo}
-            onHint={onHint}
-          />
+          {/* Smart Hint Explanation Banner */}
+          {activeHint && !isAutoSolved && (
+            <View style={styles.hintBanner}>
+              <View style={{ flex: 1, paddingRight: 8 }}>
+                <Text style={styles.hintBannerTitle}>💡 Smart Hint</Text>
+                <Text style={styles.hintBannerBody}>{activeHint.reason}</Text>
+              </View>
+              <Pressable style={styles.hintApplyBtn} onPress={applyActiveSmartHint}>
+                <Text style={styles.hintApplyBtnText}>Apply</Text>
+              </Pressable>
+            </View>
+          )}
+
+          {!settings.autoCheckErrors && isBoardFull && !isGameOver && !isWon && !isAutoSolved ? (
+            <Pressable
+              style={[styles.verifyButton, { backgroundColor: '#10B981' }]}
+              onPress={verifyCompletedBoard}
+            >
+              <Text style={styles.verifyButtonText}>✓ Verify Board</Text>
+            </Pressable>
+          ) : (
+            <Keypad
+              size={layout.size}
+              notesMode={notesMode}
+              selectedDigit={lockedDigit}
+              remainingCounts={remainingCounts}
+              canUndo={history.length > 0 && !isAutoSolved}
+              onNotesModeChange={setNotesMode}
+              onDigit={handleKeypadDigit}
+              onErase={onErase}
+              onUndo={onUndo}
+              onHint={requestSmartHint}
+            />
+          )}
         </View>
       ) : (
         <View style={styles.tabContainer}>
@@ -928,6 +1178,13 @@ export default function App() {
                 accessibilityLabel="View starred games"
               >
                 <Text style={styles.iconCircleText}>★</Text>
+              </Pressable>
+              <Pressable
+                onPress={() => setRulesModalOpen(true)}
+                style={styles.iconCircle}
+                accessibilityLabel="Rules and How to play"
+              >
+                <Text style={styles.iconCircleText}>?</Text>
               </Pressable>
               <Pressable
                 onPress={() => setThemeModalOpen(true)}
@@ -974,9 +1231,11 @@ export default function App() {
                   >
                     <View style={styles.resumeHeader}>
                       <Text style={styles.resumeTitle}>▶ Resume Game</Text>
-                      <Text style={styles.resumeTime}>
-                        {formatTime(timerSeconds)}
-                      </Text>
+                      {settings.showTimer && (
+                        <Text style={styles.resumeTime}>
+                          {formatTime(timerSeconds)}
+                        </Text>
+                      )}
                     </View>
                     <Text style={styles.resumeDetails}>
                       {layout.label} • {difficulty.toUpperCase()} • Mistakes:{' '}
@@ -1110,8 +1369,8 @@ export default function App() {
               {
                 backgroundColor: theme.cardBg,
                 borderTopColor: theme.blockBg,
-                paddingBottom: 24,
-                height: 72,
+                paddingBottom: insets.bottom > 0 ? insets.bottom : 12,
+                height: 58 + (insets.bottom > 0 ? insets.bottom : 12),
               },
             ]}
           >
@@ -1134,7 +1393,13 @@ export default function App() {
               </Text>
             </Pressable>
 
-            <Pressable onPress={() => setTab('stats')} style={styles.tabItem}>
+            <Pressable
+              onPress={() => {
+                setTab('stats');
+                refreshStats();
+              }}
+              style={styles.tabItem}
+            >
               <Text
                 style={[
                   styles.tabIcon,
@@ -1179,6 +1444,7 @@ export default function App() {
         </View>
       )}
 
+      {/* Favorites Modal */}
       <Modal visible={favoritesOpen} animationType="slide" transparent>
         <View style={styles.modalOverlay}>
           <View style={[styles.modalBox, { backgroundColor: theme.cardBg }]}>
@@ -1224,6 +1490,7 @@ export default function App() {
         </View>
       </Modal>
 
+      {/* Themes Modal */}
       <Modal visible={themeModalOpen} animationType="fade" transparent>
         <View style={styles.modalOverlay}>
           <View style={[styles.modalBox, { backgroundColor: theme.cardBg }]}>
@@ -1268,7 +1535,7 @@ export default function App() {
                 <Text
                   style={[
                     styles.segmentText,
-                    settings.themeMode === 'dark' && styles.segmentTextActive,
+                    settings.themeMode === 'dark' && styles.segmentBtnActive,
                   ]}
                 >
                   🌙 Dark
@@ -1316,12 +1583,13 @@ export default function App() {
         </View>
       </Modal>
 
+      {/* Settings Modal */}
       <Modal visible={settingsModalOpen} animationType="fade" transparent>
         <View style={styles.modalOverlay}>
           <View style={[styles.modalBox, { backgroundColor: theme.cardBg }]}>
             <View style={styles.modalHeader}>
               <Text style={[styles.modalTitle, { color: theme.textPrimary }]}>
-                Game Rules
+                Game Settings
               </Text>
               <Pressable onPress={() => setSettingsModalOpen(false)}>
                 <Text style={[styles.closeModalText, { color: theme.textSecondary }]}>
@@ -1330,26 +1598,178 @@ export default function App() {
               </Pressable>
             </View>
 
-            <View style={styles.switchRow}>
-              <View style={{ flex: 1, paddingRight: 10 }}>
-                <Text style={[styles.switchTitle, { color: theme.textPrimary }]}>
-                  3-Mistake Rule
+            <ScrollView showsVerticalScrollIndicator={false}>
+              <View style={styles.switchRow}>
+                <View style={{ flex: 1, paddingRight: 10 }}>
+                  <Text style={[styles.switchTitle, { color: theme.textPrimary }]}>
+                    Number-First Mode
+                  </Text>
+                  <Text style={[styles.switchSub, { color: theme.textSecondary }]}>
+                    Lock a number key to tap and place it across multiple cells quickly
+                  </Text>
+                </View>
+                <Switch
+                  value={settings.fastInputMode}
+                  onValueChange={(val) => {
+                    updateSettings({ fastInputMode: val });
+                    if (!val) setLockedDigit(null);
+                  }}
+                />
+              </View>
+
+              <View style={styles.switchRow}>
+                <View style={{ flex: 1, paddingRight: 10 }}>
+                  <Text style={[styles.switchTitle, { color: theme.textPrimary }]}>
+                    Highlight Duplicates
+                  </Text>
+                  <Text style={[styles.switchSub, { color: theme.textSecondary }]}>
+                    Highlight conflicting numbers in row, column, and block
+                  </Text>
+                </View>
+                <Switch
+                  value={settings.highlightDuplicates}
+                  onValueChange={(val) => updateSettings({ highlightDuplicates: val })}
+                />
+              </View>
+
+              <View style={styles.switchRow}>
+                <View style={{ flex: 1, paddingRight: 10 }}>
+                  <Text style={[styles.switchTitle, { color: theme.textPrimary }]}>
+                    Auto-Check Errors
+                  </Text>
+                  <Text style={[styles.switchSub, { color: theme.textSecondary }]}>
+                    {settings.autoCheckErrors
+                      ? 'Highlight incorrect numbers immediately'
+                      : 'Unguided Mode: Fill wrong numbers freely, verify at the end'}
+                  </Text>
+                </View>
+                <Switch
+                  value={settings.autoCheckErrors}
+                  onValueChange={(val) => updateSettings({ autoCheckErrors: val })}
+                />
+              </View>
+
+              {settings.autoCheckErrors && (
+                <View style={styles.switchRow}>
+                  <View style={{ flex: 1, paddingRight: 10 }}>
+                    <Text style={[styles.switchTitle, { color: theme.textPrimary }]}>
+                      3-Mistake Limit
+                    </Text>
+                    <Text style={[styles.switchSub, { color: theme.textSecondary }]}>
+                      {settings.limitMistakes
+                        ? 'Game Over after 3 errors'
+                        : 'Unlimited errors allowed (Relaxed Mode)'}
+                    </Text>
+                  </View>
+                  <Switch
+                    value={settings.limitMistakes}
+                    onValueChange={(val) => updateSettings({ limitMistakes: val })}
+                  />
+                </View>
+              )}
+
+              <View style={styles.switchRow}>
+                <View style={{ flex: 1, paddingRight: 10 }}>
+                  <Text style={[styles.switchTitle, { color: theme.textPrimary }]}>
+                    Auto-Clear Notes
+                  </Text>
+                  <Text style={[styles.switchSub, { color: theme.textSecondary }]}>
+                    Erase placed numbers from candidate notes in row, column, and block
+                  </Text>
+                </View>
+                <Switch
+                  value={settings.autoRemoveNotes}
+                  onValueChange={(val) => updateSettings({ autoRemoveNotes: val })}
+                />
+              </View>
+
+              <View style={styles.switchRow}>
+                <View style={{ flex: 1, paddingRight: 10 }}>
+                  <Text style={[styles.switchTitle, { color: theme.textPrimary }]}>
+                    Show Timer
+                  </Text>
+                  <Text style={[styles.switchSub, { color: theme.textSecondary }]}>
+                    Display solve timer during active games
+                  </Text>
+                </View>
+                <Switch
+                  value={settings.showTimer}
+                  onValueChange={(val) => updateSettings({ showTimer: val })}
+                />
+              </View>
+            </ScrollView>
+          </View>
+        </View>
+      </Modal>
+
+      {/* Rules Modal */}
+      <Modal visible={rulesModalOpen} animationType="slide" transparent>
+        <View style={styles.modalOverlay}>
+          <View style={[styles.modalBox, { backgroundColor: theme.cardBg, maxHeight: '82%' }]}>
+            <View style={styles.modalHeader}>
+              <Text style={[styles.modalTitle, { color: theme.textPrimary }]}>
+                How to Play Sudoku
+              </Text>
+              <Pressable onPress={() => setRulesModalOpen(false)}>
+                <Text style={[styles.closeModalText, { color: theme.textSecondary }]}>
+                  ✕
                 </Text>
-                <Text style={[styles.switchSub, { color: theme.textSecondary }]}>
-                  {settings.limitMistakes
-                    ? 'Game Over after 3 errors'
-                    : 'Unlimited errors allowed (Relaxed Mode)'}
+              </Pressable>
+            </View>
+
+            <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={{ gap: 12, paddingBottom: 16 }}>
+              <View style={[styles.statCategoryCard, { backgroundColor: theme.appBg }]}>
+                <Text style={[styles.switchTitle, { color: theme.textPrimary }]}>1. The Goal</Text>
+                <Text style={[styles.switchSub, { color: theme.textSecondary, marginTop: 4 }]}>
+                  Fill the entire board so each row, column, and block contains each digit without repetition.
                 </Text>
               </View>
-              <Switch
-                value={settings.limitMistakes}
-                onValueChange={(val) => updateSettings({ limitMistakes: val })}
-              />
-            </View>
+
+              <View style={[styles.statCategoryCard, { backgroundColor: theme.appBg }]}>
+                <Text style={[styles.switchTitle, { color: theme.textPrimary }]}>2. Standard 9x9 Grid</Text>
+                <Text style={[styles.switchSub, { color: theme.textSecondary, marginTop: 4 }]}>
+                  • Each row must contain digits 1 to 9.{'\n'}
+                  • Each column must contain digits 1 to 9.{'\n'}
+                  • Each 3x3 block must contain digits 1 to 9.
+                </Text>
+              </View>
+
+              <View style={[styles.statCategoryCard, { backgroundColor: theme.appBg }]}>
+                <Text style={[styles.switchTitle, { color: theme.textPrimary }]}>3. Input Modes</Text>
+                <Text style={[styles.switchSub, { color: theme.textSecondary, marginTop: 4 }]}>
+                  • <Text style={{ fontWeight: '700', color: theme.textPrimary }}>Cell-First (Default):</Text> Tap a cell, then tap a digit.{'\n'}
+                  • <Text style={{ fontWeight: '700', color: theme.textPrimary }}>Number-First (Fast Input):</Text> Turn on in Settings, tap a number key to lock it, then rapidly tap board cells to place it!
+                </Text>
+              </View>
+
+              <View style={[styles.statCategoryCard, { backgroundColor: theme.appBg }]}>
+                <Text style={[styles.switchTitle, { color: theme.textPrimary }]}>4. Solvers & Assists</Text>
+                <Text style={[styles.switchSub, { color: theme.textSecondary, marginTop: 4 }]}>
+                  • <Text style={{ fontWeight: '700', color: theme.textPrimary }}>Smart Hints (💡):</Text> Highlights logical deductions and explains why a move belongs there.{'\n'}
+                  • <Text style={{ fontWeight: '700', color: theme.textPrimary }}>Notes Mode (✎):</Text> Pencil in candidate numbers.{'\n'}
+                  • <Text style={{ fontWeight: '700', color: theme.textPrimary }}>Highlight Matches:</Text> Tap any placed number to see identical digits on the board.
+                </Text>
+              </View>
+            </ScrollView>
+
+            <Pressable
+              style={[styles.playButton, { backgroundColor: theme.accentBtn, marginTop: 8 }]}
+              onPress={() => setRulesModalOpen(false)}
+            >
+              <Text style={styles.playButtonText}>Got it!</Text>
+            </Pressable>
           </View>
         </View>
       </Modal>
     </View>
+  );
+}
+
+export default function App() {
+  return (
+    <SafeAreaProvider>
+      <MainApp />
+    </SafeAreaProvider>
   );
 }
 
@@ -1549,11 +1969,9 @@ const styles = StyleSheet.create({
   },
   bottomTabBar: {
     flexDirection: 'row',
-    height: 72,
     borderTopWidth: 1,
     justifyContent: 'space-around',
     alignItems: 'center',
-    paddingBottom: 24,
   },
   tabItem: {
     alignItems: 'center',
@@ -1604,23 +2022,64 @@ const styles = StyleSheet.create({
     fontSize: 13,
     fontWeight: '600',
   },
-  pauseButton: {
+  smallActionBtn: {
     paddingVertical: 4,
     paddingHorizontal: 8,
     borderRadius: 6,
   },
-  pauseButtonText: {
+  smallActionText: {
     fontSize: 12,
     fontWeight: '600',
   },
-  solveButton: {
-    paddingVertical: 4,
-    paddingHorizontal: 8,
+  hintBanner: {
+    width: '100%',
+    maxWidth: 420,
+    backgroundColor: '#FEF9C3',
+    borderColor: '#FDE047',
+    borderWidth: 1,
+    borderRadius: 10,
+    padding: 10,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginTop: 8,
+  },
+  hintBannerTitle: {
+    fontSize: 13,
+    fontWeight: '700',
+    color: '#854D0E',
+  },
+  hintBannerBody: {
+    fontSize: 12,
+    color: '#713F12',
+    marginTop: 2,
+  },
+  hintApplyBtn: {
+    backgroundColor: '#CA8A04',
+    paddingVertical: 6,
+    paddingHorizontal: 14,
     borderRadius: 6,
   },
-  solveButtonText: {
-    fontSize: 12,
-    fontWeight: '600',
+  hintApplyBtnText: {
+    color: '#FFFFFF',
+    fontSize: 13,
+    fontWeight: '700',
+  },
+  verifyButton: {
+    width: '100%',
+    maxWidth: 420,
+    paddingVertical: 14,
+    borderRadius: 10,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginTop: 14,
+    elevation: 3,
+  },
+  verifyButtonText: {
+    color: '#FFFFFF',
+    fontSize: 16,
+    fontWeight: '800',
+    letterSpacing: 1,
   },
   modalOverlay: {
     flex: 1,
