@@ -5,6 +5,7 @@ import { supabase } from './lib/supabase';
 import type { User } from '@supabase/supabase-js';
 import { getCurrentUser, signInWithGoogle, signOutUser } from './lib/auth';
 import { recordGameRunToSupabase } from './lib/gameSync';
+import { syncUserDataUponLogin } from './lib/gameSync';
 import * as Application from 'expo-application';
 import {
   Alert,
@@ -118,6 +119,10 @@ export default function App() {
   const [layout, setLayout] = useState<BoardLayout>(DEFAULT_BOARD_LAYOUT);
   const [difficulty, setDifficulty] = useState<Difficulty>('medium');
 
+  // Dedicated picker states for the Home screen selection
+  const [pickerLayout, setPickerLayout] = useState<BoardLayout>(DEFAULT_BOARD_LAYOUT);
+  const [pickerDifficulty, setPickerDifficulty] = useState<Difficulty>('medium');
+
   const [gameId, setGameId] = useState<string>(() => Date.now().toString());
   const [values, setValues] = useState<CellValue[][]>([]);
   const [solution, setSolution] = useState<CellValue[][]>([]);
@@ -130,6 +135,7 @@ export default function App() {
   const [history, setHistory] = useState<MoveSnapshot[]>([]);
 
   const [mistakes, setMistakes] = useState(0);
+  const [hintsUsed, setHintsUsed] = useState(0);
   const [timerSeconds, setTimerSeconds] = useState(0);
   const [isGameOver, setIsGameOver] = useState(false);
   const [isWon, setIsWon] = useState(false);
@@ -245,10 +251,36 @@ export default function App() {
   const streakKey = `${layout.label} - ${difficulty.toUpperCase()}`;
 
   useEffect(() => {
-    getCurrentUser().then((u) => setUser(u));
-    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
-      setUser(session?.user ?? null);
+    getCurrentUser().then((u) => {
+      setUser(u);
+      if (u) {
+        syncUserDataUponLogin(
+          (cloudStats) => {
+            console.log('📊 Stats synchronized on boot:', cloudStats);
+          },
+          (remoteFavorites) => {
+            setFavorites(remoteFavorites);
+          },
+        );
+      }
     });
+
+    const { data: { subscription } } = supabase.auth.onAuthStateChange(async (_event, session) => {
+      const currentUser = session?.user ?? null;
+      setUser(currentUser);
+
+      if (currentUser) {
+        await syncUserDataUponLogin(
+          (cloudStats) => {
+            console.log('📊 Stats synchronized on login:', cloudStats);
+          },
+          (remoteFavorites) => {
+            setFavorites(remoteFavorites);
+          },
+        );
+      }
+    });
+
     return () => {
       subscription.unsubscribe();
     };
@@ -373,10 +405,12 @@ export default function App() {
     ]);
   }, [errors, mistakes, notes, values]);
 
-  const [hintsUsed, setHintsUsed] = useState(0);
-  
+
   const startNewGame = useCallback(
     (targetLayout: BoardLayout, targetDifficulty: Difficulty) => {
+      setLayout(targetLayout);
+      setDifficulty(targetDifficulty);
+
       const { puzzle, solution: solvedBoard } = generate(
         targetLayout,
         targetDifficulty,
@@ -510,20 +544,20 @@ export default function App() {
     [difficulty, layout, mistakes, startNewGame, stats, streakKey, deviceId],
   );
 
-  const recordLoss = useCallback(async () => {
+  const recordLoss = useCallback(async (finalMistakes: number) => {
     setIsGameOver(true);
     setHasSavedGame(false);
-
+  
     await recordGameRunToSupabase({
       gridSize: layout.size,
       difficulty: difficulty,
       timeSeconds: timerSeconds,
-      mistakes: mistakes,
-      hintsUsed: 0,
+      mistakes: finalMistakes, // 👈 use the passed mistake count
+      hintsUsed: hintsUsed,
       status: 'lost',
       deviceId: deviceId,
     });
-  }, [difficulty, layout.size, mistakes, timerSeconds, deviceId]);
+  }, [difficulty, layout.size, timerSeconds, hintsUsed, deviceId]);
 
   const remainingCounts = useMemo(() => {
     const counts: Record<number, number> = {};
@@ -580,12 +614,12 @@ export default function App() {
   }, [history, isGameOver, isPaused, isWon]);
 
   const onHint = useCallback(() => {
-    setHintsUsed(hintsUsed + 1);
     if (selected == null || isGameOver || isWon || isPaused) return;
     const { row, col } = selected;
     if (initialClues[row]?.[col]) return;
     if (values[row]?.[col] === solution[row]?.[col]) return;
 
+    setHintsUsed((prev) => prev + 1);
     pushHistory();
     const correctVal = solution[row][col]!;
 
@@ -686,7 +720,7 @@ export default function App() {
       if (!isCorrect) {
         setMistakes(nextMistakes);
         if (settings.limitMistakes && nextMistakes >= 3) {
-          recordLoss();
+          recordLoss(nextMistakes); // 👈 Put it right here! Pass nextMistakes into it.
           Alert.alert(
             'Game Over',
             'You made 3 mistakes. Better luck next time!',
@@ -926,7 +960,7 @@ export default function App() {
                   resizeMode="contain"
                 />
                 <Text style={[styles.title, { color: theme.textPrimary }]}>
-                  RAMCRAFT
+                  RamCraft
                 </Text>
                 <Text style={[styles.subtitle, { color: theme.textSecondary }]}>
                   Classic Logic Challenge
@@ -947,21 +981,21 @@ export default function App() {
                       </Text>
                     </View>
                     <Text style={styles.resumeDetails}>
-                      {layout.label} • {difficulty.toUpperCase()} • Mistakes:{' '}
+                    {layout.label} • {difficulty.toUpperCase()} • Mistakes:{' '}
                       {settings.limitMistakes ? `${mistakes}/3` : mistakes}
                     </Text>
                   </Pressable>
                 )}
 
-                <SizePicker layout={layout} onChange={setLayout} />
+                <SizePicker layout={pickerLayout} onChange={setPickerLayout} />
                 <DifficultyPicker
-                  difficulty={difficulty}
-                  onChange={setDifficulty}
+                  difficulty={pickerDifficulty}
+                  onChange={setPickerDifficulty}
                 />
 
                 <Pressable
                   style={[styles.playButton, { backgroundColor: theme.accentBtn }]}
-                  onPress={() => startNewGame(layout, difficulty)}
+                  onPress={() => startNewGame(pickerLayout, pickerDifficulty)}
                 >
                   <Text style={styles.playButtonText}>Start New Game</Text>
                 </Pressable>
