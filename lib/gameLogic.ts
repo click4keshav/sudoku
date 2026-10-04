@@ -1,7 +1,7 @@
 import type { BoardLayout } from './boardLayouts';
 import type { CellValue } from '../components/Board';
 
-export type Difficulty = 'easy' | 'medium' | 'hard';
+export type Difficulty = 'easy' | 'medium' | 'hard' | 'expert';
 
 /**
  * Checks whether placing `num` at (row, col) is valid under Sudoku rules.
