@@ -10,6 +10,21 @@ import {
   fetchUserStatsFromCloud,
   syncActiveGameToCloud,
   clearActiveGameFromCloud,
+  fetchGlobalLeaderboard,
+  toggleFollowUser,
+  recordDailyChallengeRun,
+  fetchMonthlyDailyChallenges,
+  fetchUserDailyStreak,
+  fetchUserAchievements,
+  updateCustomProfile,
+  getCustomProfile,
+  exportUserDataJson,
+  deleteUserCloudDataRpc,
+  ACHIEVEMENTS_METADATA,
+  type DailyChallengeRun,
+  type DailyStreakData,
+  type LeaderboardEntry,
+  type Timeframe,
   STATS_KEY,
 } from './lib/gameSync';
 import * as Application from 'expo-application';
@@ -23,9 +38,11 @@ import {
   Modal,
   Pressable,
   ScrollView,
+  Share,
   StyleSheet,
   Switch,
   Text,
+  TextInput,
   View,
 } from 'react-native';
 import Board, {
@@ -41,7 +58,11 @@ import {
   BOARD_LAYOUTS,
   type BoardLayout,
 } from './lib/boardLayouts';
-import { generate, type Difficulty } from './lib/gameLogic';
+import {
+  generate,
+  generateDailyChallenge,
+  type Difficulty,
+} from './lib/gameLogic';
 
 const STORAGE_KEY = '@sudoku_save_v4';
 const FAVORITES_KEY = '@sudoku_favorites_v4';
@@ -59,6 +80,8 @@ type CategoryStats = {
   won: number;
   bestTime: number | null;
   streak: number;
+  totalScore?: number;
+  bestScore?: number;
 };
 
 type AllStats = Record<string, CategoryStats>;
@@ -134,6 +157,18 @@ function formatTime(seconds: number): string {
   return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
 }
 
+function getTodayString(): string {
+  const d = new Date();
+  const year = d.getFullYear();
+  const month = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+}
+
+const AVATAR_PRESETS = [
+  '🦊', '🐼', '🦁', '🦉', '🚀', '⚡', '🎮', '🧩', '👑', '🔥'
+];
+
 function MainApp() {
   const insets = useSafeAreaInsets();
 
@@ -143,6 +178,31 @@ function MainApp() {
   const [themeModalOpen, setThemeModalOpen] = useState(false);
   const [settingsModalOpen, setSettingsModalOpen] = useState(false);
   const [rulesModalOpen, setRulesModalOpen] = useState(false);
+
+  // Leaderboard modal state
+  const [leaderboardOpen, setLeaderboardOpen] = useState(false);
+  const [leaderboardType, setLeaderboardType] = useState<'career' | 'peak'>('career');
+  const [leaderboardTimeframe, setLeaderboardTimeframe] = useState<Timeframe>('all_time');
+  const [friendsOnly, setFriendsOnly] = useState(false);
+  const [leaderboardData, setLeaderboardData] = useState<LeaderboardEntry[]>([]);
+  const [loadingLeaderboard, setLoadingLeaderboard] = useState(false);
+
+  // Daily Challenge state
+  const [calendarModalOpen, setCalendarModalOpen] = useState(false);
+  const [isDailyChallengeActive, setIsDailyChallengeActive] = useState(false);
+  const [activeDailyDate, setActiveDailyDate] = useState<string>(getTodayString());
+  const [monthlyChallenges, setMonthlyChallenges] = useState<Record<string, DailyChallengeRun>>({});
+  const [dailyStreak, setDailyStreak] = useState<DailyStreakData>({ currentStreak: 0, bestStreak: 0, totalCompleted: 0 });
+
+  // Achievements state
+  const [unlockedAchievements, setUnlockedAchievements] = useState<string[]>([]);
+  const [achievementToast, setAchievementToast] = useState<{ title: string; icon: string } | null>(null);
+
+  // Profile Customization state
+  const [profileModalOpen, setProfileModalOpen] = useState(false);
+  const [customName, setCustomName] = useState('');
+  const [customAvatar, setCustomAvatar] = useState<string | null>(null);
+  const [syncingNow, setSyncingNow] = useState(false);
 
   const [settings, setSettings] = useState<AppSettings>(DEFAULT_SETTINGS);
   const [layout, setLayout] = useState<BoardLayout>(DEFAULT_BOARD_LAYOUT);
@@ -280,6 +340,51 @@ function MainApp() {
     };
   }, [isDark, settings.accentTheme]);
 
+  const { totalCareerXP, peakSkillScore } = useMemo(() => {
+    let career = 0;
+    let peak = 0;
+    Object.values(stats).forEach((item) => {
+      career += item.totalScore || 0;
+      peak = Math.max(peak, item.bestScore || 0);
+    });
+    return { totalCareerXP: career, peakSkillScore: peak };
+  }, [stats]);
+
+  // Visual Career Analytics breakdown
+  const analyticsData = useMemo(() => {
+    const diffs: Difficulty[] = ['easy', 'medium', 'hard', 'expert'];
+    return diffs.map((diff) => {
+      let started = 0;
+      let won = 0;
+      let timeSum = 0;
+      let timeCount = 0;
+
+      BOARD_LAYOUTS.forEach((l) => {
+        const k = `${l.label} - ${diff.toUpperCase()}`;
+        const s = stats[k];
+        if (s) {
+          started += s.started || 0;
+          won += s.won || 0;
+          if (s.bestTime) {
+            timeSum += s.bestTime;
+            timeCount++;
+          }
+        }
+      });
+
+      const winRate = started > 0 ? Math.round((won / started) * 100) : 0;
+      const avgBestTime = timeCount > 0 ? Math.round(timeSum / timeCount) : 0;
+
+      return {
+        difficulty: diff.toUpperCase(),
+        started,
+        won,
+        winRate,
+        avgBestTime,
+      };
+    });
+  }, [stats]);
+
   const refreshStats = useCallback(async () => {
     const freshStats = await fetchUserStatsFromCloud();
     if (freshStats) {
@@ -287,21 +392,142 @@ function MainApp() {
     }
   }, []);
 
+  const refreshDailyData = useCallback(async () => {
+    try {
+      const now = new Date();
+      const monthMap = await fetchMonthlyDailyChallenges(now.getFullYear(), now.getMonth() + 1);
+      const streakData = await fetchUserDailyStreak();
+      if (monthMap) setMonthlyChallenges(monthMap);
+      if (streakData) setDailyStreak(streakData);
+    } catch {
+      // Gracefully prevent uncaught errors
+    }
+  }, []);
+
+  const refreshAchievements = useCallback(async () => {
+    const list = await fetchUserAchievements();
+    setUnlockedAchievements(list);
+  }, []);
+
+  const handleForceSync = async () => {
+    setSyncingNow(true);
+    await syncUserDataUponLogin(
+      deviceId,
+      (cloudStats) => cloudStats && setStats(cloudStats),
+      (remoteFavorites) => setFavorites(remoteFavorites),
+      undefined,
+      () => {
+        refreshDailyData();
+        refreshAchievements();
+      }
+    );
+    await refreshStats();
+    setSyncingNow(false);
+    Alert.alert('Sync Complete', 'All local runs, statistics, and records have been synced with the cloud.');
+  };
+
+  const handleExportData = async () => {
+    await exportUserDataJson();
+  };
+
+  const handleDeleteCloudData = () => {
+    Alert.alert(
+      'Delete Cloud Records?',
+      'This will permanently delete all your leaderboards, statistics, and challenge runs from the cloud. This action cannot be undone.',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Permanently Delete',
+          style: 'destructive',
+          onPress: async () => {
+            const success = await deleteUserCloudDataRpc();
+            if (success) {
+              setStats({});
+              setDailyStreak({ currentStreak: 0, bestStreak: 0, totalCompleted: 0 });
+              setMonthlyChallenges({});
+              setUnlockedAchievements([]);
+              Alert.alert('Deleted', 'Your cloud records have been permanently cleared.');
+            } else {
+              Alert.alert('Error', 'Could not delete records. Please try again.');
+            }
+          },
+        },
+      ]
+    );
+  };
+
+  const handleSaveProfile = async () => {
+    if (!customName.trim()) {
+      Alert.alert('Validation', 'Display name cannot be blank.');
+      return;
+    }
+    await updateCustomProfile(customName.trim(), customAvatar);
+    setProfileModalOpen(false);
+    Alert.alert('Saved', 'Your public display profile has been updated!');
+  };
+
+  const loadLeaderboard = useCallback(async () => {
+    setLoadingLeaderboard(true);
+    const data = await fetchGlobalLeaderboard(leaderboardType, leaderboardTimeframe, friendsOnly);
+    setLeaderboardData(data);
+    setLoadingLeaderboard(false);
+  }, [leaderboardType, leaderboardTimeframe, friendsOnly]);
+
+  const openLeaderboardModal = useCallback(() => {
+    setLeaderboardOpen(true);
+    loadLeaderboard();
+  }, [loadLeaderboard]);
+
+  useEffect(() => {
+    if (leaderboardOpen) {
+      loadLeaderboard();
+    }
+  }, [leaderboardType, leaderboardTimeframe, friendsOnly, leaderboardOpen, loadLeaderboard]);
+
+  const handleToggleFollow = async (targetUserId: string, currentFollowing: boolean) => {
+    if (!user) {
+      Alert.alert('Sign In Required', 'Please sign in with Google to follow players and view your Friends leaderboard.');
+      return;
+    }
+    const success = await toggleFollowUser(targetUserId, !currentFollowing);
+    if (success) {
+      setLeaderboardData((prev) =>
+        prev.map((p) => (p.userId === targetUserId ? { ...p, isFollowing: !currentFollowing } : p)),
+      );
+    }
+  };
+
+  const triggerAchievementBanner = useCallback((id: string) => {
+    const meta = ACHIEVEMENTS_METADATA.find((m) => m.id === id);
+    if (meta) {
+      setAchievementToast({ title: meta.title, icon: meta.icon });
+      setTimeout(() => setAchievementToast(null), 4000);
+    }
+  }, []);
+
+  const shareGameResult = useCallback((timeSecs: number, totalMistakes: number, totalScore: number) => {
+    const mistakesBlock = totalMistakes === 0 ? '🟩🟩🟩 (0 mistakes)' : `${'🟥'.repeat(Math.min(totalMistakes, 3))} (${totalMistakes} errors)`;
+    const text = `🧩 RamCraft Sudoku Daily Challenge\n📅 ${activeDailyDate}\n⏱️ Time: ${formatTime(timeSecs)}\n⚡ Score: +${totalScore} XP\n🎯 Accuracy: ${mistakesBlock}\n\nPlay at: https://ramcraft.app`;
+    Share.share({ message: text });
+  }, [activeDailyDate]);
+
   const restoreActiveGamePayload = useCallback((p: any) => {
     if (!p || !p.values || p.values.length === 0) return;
     setGameId(p.gameId || Date.now().toString());
-    setLayout(p.layout);
-    setDifficulty(p.difficulty);
+    setLayout(p.layout || DEFAULT_BOARD_LAYOUT);
+    setDifficulty(p.difficulty || 'medium');
     setValues(p.values);
     setSolution(p.solution);
     setInitialClues(p.initialClues);
-    setErrors(p.errors || emptyErrors(p.layout.size));
-    setNotes(p.notes || emptyNotes(p.layout.size));
+    setErrors(p.errors || emptyErrors(p.layout?.size || 9));
+    setNotes(p.notes || emptyNotes(p.layout?.size || 9));
     setMistakes(p.mistakes || 0);
     setTimerSeconds(p.timerSeconds || 0);
     setIsGameOver(false);
     setIsWon(false);
     setIsAutoSolved(false);
+    setIsDailyChallengeActive(p.isDailyChallengeActive || false);
+    setActiveDailyDate(p.activeDailyDate || getTodayString());
     setHistory(p.history || []);
     setHasSavedGame(true);
   }, []);
@@ -315,6 +541,10 @@ function MainApp() {
           (cloudStats) => cloudStats && setStats(cloudStats),
           (remoteFavorites) => setFavorites(remoteFavorites),
           (remoteActiveGame) => restoreActiveGamePayload(remoteActiveGame),
+          () => {
+            refreshDailyData();
+            refreshAchievements();
+          },
         );
       }
     });
@@ -328,46 +558,58 @@ function MainApp() {
           (cloudStats) => cloudStats && setStats(cloudStats),
           (remoteFavorites) => setFavorites(remoteFavorites),
           (remoteActiveGame) => restoreActiveGamePayload(remoteActiveGame),
+          () => {
+            refreshDailyData();
+            refreshAchievements();
+          },
         );
       }
     });
 
     return () => subscription.unsubscribe();
-  }, [deviceId, restoreActiveGamePayload]);
+  }, [deviceId, refreshAchievements, refreshDailyData, restoreActiveGamePayload]);
 
   useEffect(() => {
     async function loadData() {
       try {
-        const [savedStats, savedSettings, savedFavs, savedGame] =
+        const [savedStats, savedSettings, savedFavs, savedGame, customProf] =
           await Promise.all([
             AsyncStorage.getItem(STATS_KEY),
             AsyncStorage.getItem(SETTINGS_KEY),
             AsyncStorage.getItem(FAVORITES_KEY),
             AsyncStorage.getItem(STORAGE_KEY),
+            getCustomProfile(),
           ]);
 
         if (savedStats) setStats(JSON.parse(savedStats));
         if (savedSettings) setSettings(JSON.parse(savedSettings));
         if (savedFavs) setFavorites(JSON.parse(savedFavs));
+        if (customProf) {
+          setCustomName(customProf.displayName);
+          setCustomAvatar(customProf.avatarUrl);
+        }
 
         const currentUser = await getCurrentUser();
         if (currentUser) {
           await refreshStats();
         }
 
+        await refreshDailyData();
+        await refreshAchievements();
+
         if (savedGame != null) {
           const p = JSON.parse(savedGame);
           restoreActiveGamePayload(p);
         }
       } catch (err) {
-        console.warn('Load err:', err);
+        console.warn('App Init Note:', err);
       } finally {
         setIsLoaded(true);
         isLoadedRef.current = true;
       }
     }
     loadData();
-  }, [refreshStats, restoreActiveGamePayload]);
+  }, [refreshAchievements, refreshDailyData, refreshStats, restoreActiveGamePayload]);
 
   useEffect(() => {
     if (screen !== 'game' || isPaused || isGameOver || isWon || isAutoSolved) return;
@@ -395,6 +637,8 @@ function MainApp() {
       isGameOver,
       isWon,
       isAutoSolved,
+      isDailyChallengeActive,
+      activeDailyDate,
       history,
     };
 
@@ -410,21 +654,23 @@ function MainApp() {
       clearActiveGameFromCloud();
     }
   }, [
-    gameId,
-    layout,
+    activeDailyDate,
     difficulty,
-    values,
-    solution,
-    initialClues,
     errors,
-    notes,
-    mistakes,
-    timerSeconds,
+    gameId,
+    history,
+    initialClues,
+    isAutoSolved,
+    isDailyChallengeActive,
     isGameOver,
     isWon,
-    isAutoSolved,
-    history,
+    layout,
+    mistakes,
+    notes,
+    solution,
+    timerSeconds,
     user,
+    values,
   ]);
 
   const updateSettings = (newSettings: Partial<AppSettings>) => {
@@ -473,8 +719,51 @@ function MainApp() {
       setIsGameOver(false);
       setIsWon(false);
       setIsAutoSolved(false);
+      setIsDailyChallengeActive(false);
       setIsPaused(false);
       setHistory([]);
+      setScreen('game');
+    },
+    [],
+  );
+
+  const startDailyGame = useCallback(
+    (dateStr: string) => {
+      const standard9x9Layout: BoardLayout = {
+        id: '9x9',
+        label: '9x9',
+        size: 9,
+        boxRows: 3,
+        boxCols: 3,
+      };
+      setLayout(standard9x9Layout);
+
+      const { puzzle, solution: solvedBoard, difficulty: dailyDiff } =
+        generateDailyChallenge(dateStr);
+      setDifficulty(dailyDiff);
+
+      const clues = puzzle.map((row) => row.map((cell) => cell !== null));
+
+      setGameId(`daily-${dateStr}`);
+      setValues(puzzle);
+      setSolution(solvedBoard);
+      setInitialClues(clues);
+      setErrors(emptyErrors(9));
+      setNotes(emptyNotes(9));
+      setSelected(null);
+      setLockedDigit(null);
+      setActiveHint(null);
+      setMistakes(0);
+      setHintsUsed(0);
+      setTimerSeconds(0);
+      setIsGameOver(false);
+      setIsWon(false);
+      setIsAutoSolved(false);
+      setIsDailyChallengeActive(true);
+      setActiveDailyDate(dateStr);
+      setIsPaused(false);
+      setHistory([]);
+      setCalendarModalOpen(false);
       setScreen('game');
     },
     [],
@@ -560,6 +849,7 @@ function MainApp() {
     setIsGameOver(false);
     setIsWon(false);
     setIsAutoSolved(false);
+    setIsDailyChallengeActive(false);
     setFavoritesOpen(false);
     setScreen('game');
   };
@@ -582,6 +872,24 @@ function MainApp() {
         deviceId: deviceId,
       });
 
+      if (isDailyChallengeActive) {
+        const streakData = await recordDailyChallengeRun({
+          challengeDate: activeDailyDate,
+          status: 'won',
+          timeSeconds: finalTime,
+          mistakes: totalMistakes,
+          hintsUsed: hintsUsed,
+          score: res?.earnedScore || 100,
+        });
+        if (streakData) setDailyStreak(streakData);
+        await refreshDailyData();
+      }
+
+      if (res?.newlyUnlockedBadges && res.newlyUnlockedBadges.length > 0) {
+        res.newlyUnlockedBadges.forEach((id: string) => triggerAchievementBanner(id));
+        await refreshAchievements();
+      }
+
       if (res?.localStats) {
         setStats(res.localStats);
       }
@@ -590,16 +898,38 @@ function MainApp() {
         await refreshStats();
       }
 
+      const alertButtons: any[] = [
+        { text: 'Home', onPress: () => setScreen('home') },
+      ];
+
+      if (isDailyChallengeActive) {
+        alertButtons.unshift({
+          text: '📤 Share Result',
+          onPress: () => shareGameResult(finalTime, totalMistakes, res?.earnedScore || 100),
+        });
+      }
+
       Alert.alert(
-        '🎉 Congratulations!',
-        `Puzzle solved in ${formatTime(finalTime)} with ${totalMistakes} mistake(s)!`,
-        [
-          { text: 'Play Again', onPress: () => startNewGame(layout, difficulty) },
-          { text: 'Home', onPress: () => setScreen('home') },
-        ],
+        isDailyChallengeActive ? '🌟 Daily Challenge Solved!' : '🎉 Congratulations!',
+        `Puzzle solved in ${formatTime(finalTime)}!\nScore Earned: +${res?.earnedScore || 100} XP`,
+        alertButtons,
       );
     },
-    [difficulty, isAutoSolved, layout, refreshStats, startNewGame, deviceId, hintsUsed, user],
+    [
+      activeDailyDate,
+      deviceId,
+      difficulty,
+      hintsUsed,
+      isAutoSolved,
+      isDailyChallengeActive,
+      layout.size,
+      refreshAchievements,
+      refreshDailyData,
+      refreshStats,
+      shareGameResult,
+      triggerAchievementBanner,
+      user,
+    ],
   );
 
   const recordLoss = useCallback(
@@ -620,6 +950,18 @@ function MainApp() {
         deviceId: deviceId,
       });
 
+      if (isDailyChallengeActive) {
+        await recordDailyChallengeRun({
+          challengeDate: activeDailyDate,
+          status: 'lost',
+          timeSeconds: timerSeconds,
+          mistakes: finalMistakes,
+          hintsUsed: hintsUsed,
+          score: 0,
+        });
+        await refreshDailyData();
+      }
+
       if (res?.localStats) {
         setStats(res.localStats);
       }
@@ -628,7 +970,19 @@ function MainApp() {
         await refreshStats();
       }
     },
-    [difficulty, isAutoSolved, layout.size, refreshStats, timerSeconds, hintsUsed, deviceId, user],
+    [
+      activeDailyDate,
+      deviceId,
+      difficulty,
+      hintsUsed,
+      isAutoSolved,
+      isDailyChallengeActive,
+      layout.size,
+      refreshDailyData,
+      refreshStats,
+      timerSeconds,
+      user,
+    ],
   );
 
   const remainingCounts = useMemo(() => {
@@ -684,21 +1038,24 @@ function MainApp() {
         'Game Over',
         `Puzzle verification failed! You had ${wrongCount} incorrect cell(s).`,
         [
-          { text: 'Try Again', onPress: () => startNewGame(layout, difficulty) },
+          { text: 'Try Again', onPress: () => isDailyChallengeActive ? startDailyGame(activeDailyDate) : startNewGame(layout, difficulty) },
           { text: 'Restart Board', onPress: restartCurrentGame },
           { text: 'Home', onPress: () => setScreen('home') },
         ],
       );
     }
   }, [
+    activeDailyDate,
     difficulty,
     isAutoSolved,
-    layout.size,
+    isDailyChallengeActive,
+    layout,
     mistakes,
     recordLoss,
     recordWin,
     restartCurrentGame,
     solution,
+    startDailyGame,
     startNewGame,
     timerSeconds,
     values,
@@ -809,7 +1166,7 @@ function MainApp() {
               'Game Over',
               'You made 3 mistakes. Better luck next time!',
               [
-                { text: 'Try Again', onPress: () => startNewGame(layout, difficulty) },
+                { text: 'Try Again', onPress: () => isDailyChallengeActive ? startDailyGame(activeDailyDate) : startNewGame(layout, difficulty) },
                 { text: 'Restart Board', onPress: restartCurrentGame },
                 { text: 'Home', onPress: () => setScreen('home') },
               ],
@@ -851,11 +1208,13 @@ function MainApp() {
       }
     },
     [
+      activeDailyDate,
       clearSurroundingNotes,
       computeConflictGrid,
       difficulty,
       initialClues,
       isAutoSolved,
+      isDailyChallengeActive,
       isGameOver,
       isPaused,
       isWon,
@@ -871,6 +1230,7 @@ function MainApp() {
       settings.highlightDuplicates,
       settings.limitMistakes,
       solution,
+      startDailyGame,
       startNewGame,
       timerSeconds,
       values,
@@ -1022,11 +1382,40 @@ function MainApp() {
 
   if (!isLoaded) return null;
 
-  const avatarUrl = user?.user_metadata?.avatar_url || user?.user_metadata?.picture;
+  const todayStr = getTodayString();
+  const todayChallenge = monthlyChallenges[todayStr];
+  const isTodayCompleted = todayChallenge?.status === 'won';
+  const avatarUrl = customAvatar || user?.user_metadata?.avatar_url || user?.user_metadata?.picture;
+  const activeDisplayName = customName || user?.user_metadata?.full_name || user?.user_metadata?.name || (user ? 'RamCraft Player' : 'Guest Player');
+
+  const now = new Date();
+  const year = now.getFullYear();
+  const month = now.getMonth();
+  const daysInMonth = new Date(year, month + 1, 0).getDate();
+  const firstDayIndex = new Date(year, month, 1).getDay();
+
+  // Monthly Crown calculation
+  const completedCountInMonth = Object.keys(monthlyChallenges).filter(
+    (k) => k.startsWith(`${year}-${String(month + 1).padStart(2, '0')}`) && monthlyChallenges[k].status === 'won',
+  ).length;
+
+  const monthlyCrownTier =
+    completedCountInMonth >= daysInMonth ? 'gold' : completedCountInMonth >= 20 ? 'silver' : completedCountInMonth >= 10 ? 'bronze' : null;
 
   return (
     <View style={[styles.container, { backgroundColor: theme.appBg }]}>
       <StatusBar style={isDark ? 'light' : 'dark'} />
+
+      {/* Real-time Achievement Toast */}
+      {achievementToast && (
+        <View style={styles.achievementToast}>
+          <Text style={styles.achievementToastIcon}>{achievementToast.icon}</Text>
+          <View style={{ flex: 1 }}>
+            <Text style={styles.achievementToastBadge}>ACHIEVEMENT UNLOCKED!</Text>
+            <Text style={styles.achievementToastTitle}>{achievementToast.title}</Text>
+          </View>
+        </View>
+      )}
 
       {screen === 'game' ? (
         <View style={styles.gameContent}>
@@ -1037,6 +1426,10 @@ function MainApp() {
                   ‹ Back
                 </Text>
               </Pressable>
+
+              <Text style={[styles.gameHeaderCenterTitle, { color: theme.textPrimary }]}>
+                {isDailyChallengeActive ? `Daily Challenge (${activeDailyDate})` : `${layout.label} • ${difficulty.toUpperCase()}`}
+              </Text>
 
               <View style={styles.topRightActions}>
                 <Pressable
@@ -1169,7 +1562,7 @@ function MainApp() {
         <View style={styles.tabContainer}>
           <View style={styles.appHeader}>
             <Text style={[styles.appHeaderTitle, { color: theme.textPrimary }]}>
-              {tab === 'home' ? 'Ramcraft' : tab === 'stats' ? 'Statistics' : 'Profile'}
+              {tab === 'home' ? 'RamCraft' : tab === 'stats' ? 'Statistics' : 'Profile'}
             </Text>
             <View style={styles.topRightActions}>
               <Pressable
@@ -1204,22 +1597,40 @@ function MainApp() {
           </View>
 
           {tab === 'home' && (
-            <ScrollView
-              contentContainerStyle={styles.homeScrollContent}
-              showsVerticalScrollIndicator={false}
-            >
-              <View style={styles.homeCardWrapper}>
+            <View style={styles.homeFixedContainer}>
+              {/* TOP: Daily Challenge Card */}
+              <View style={[styles.dailyCard, { backgroundColor: isTodayCompleted ? '#065F46' : '#1E3A8A' }]}>
+                <View style={styles.dailyCardHeader}>
+                  <Text style={styles.dailyCardBadge}>
+                    {isTodayCompleted ? '✓ TODAY COMPLETED' : '⭐ DAILY CHALLENGE'}
+                  </Text>
+                  <Text style={styles.dailyStreakTag}>🔥 {dailyStreak.currentStreak} Day Streak</Text>
+                </View>
+                <View style={styles.dailyCardBtnRow}>
+                  <Pressable
+                    style={styles.dailyPlayBtn}
+                    onPress={() => startDailyGame(todayStr)}
+                  >
+                    <Text style={styles.dailyPlayBtnText}>
+                      {isTodayCompleted ? 'Replay Challenge' : "Play Today's Puzzle"}
+                    </Text>
+                  </Pressable>
+                  <Pressable
+                    style={styles.dailyCalendarBtn}
+                    onPress={() => setCalendarModalOpen(true)}
+                  >
+                    <Text style={styles.dailyCalendarBtnText}>📅 Calendar</Text>
+                  </Pressable>
+                </View>
+              </View>
+
+              {/* MIDDLE: 100x100 Logo + Resume Game Below It */}
+              <View style={styles.middleSection}>
                 <Image
                   source={require('./assets/logo.png')}
-                  style={styles.logoImage}
+                  style={styles.centerLogoImage}
                   resizeMode="contain"
                 />
-                <Text style={[styles.title, { color: theme.textPrimary }]}>
-                  Ramcraft
-                </Text>
-                <Text style={[styles.subtitle, { color: theme.textSecondary }]}>
-                  Classic Logic Challenge
-                </Text>
 
                 {hasSavedGame && (
                   <Pressable
@@ -1238,26 +1649,28 @@ function MainApp() {
                       )}
                     </View>
                     <Text style={styles.resumeDetails}>
-                      {layout.label} • {difficulty.toUpperCase()} • Mistakes:{' '}
+                      {isDailyChallengeActive ? `Daily (${activeDailyDate})` : `${layout.label} • ${difficulty.toUpperCase()}`} • Mistakes:{' '}
                       {settings.limitMistakes ? `${mistakes}/3` : mistakes}
                     </Text>
                   </Pressable>
                 )}
+              </View>
 
+              {/* BOTTOM: Custom Game Controls */}
+              <View style={styles.bottomControlsSection}>
                 <SizePicker layout={pickerLayout} onChange={setPickerLayout} />
                 <DifficultyPicker
                   difficulty={pickerDifficulty}
                   onChange={setPickerDifficulty}
                 />
-
                 <Pressable
                   style={[styles.playButton, { backgroundColor: theme.accentBtn }]}
                   onPress={() => startNewGame(pickerLayout, pickerDifficulty)}
                 >
-                  <Text style={styles.playButtonText}>Start New Game</Text>
+                  <Text style={styles.playButtonText}>Start Custom Game</Text>
                 </Pressable>
               </View>
-            </ScrollView>
+            </View>
           )}
 
           {tab === 'stats' && (
@@ -1265,8 +1678,66 @@ function MainApp() {
               contentContainerStyle={styles.statsScrollContent}
               showsVerticalScrollIndicator={false}
             >
+              <View style={styles.ratingOverviewRow}>
+                <View style={[styles.ratingCard, { backgroundColor: theme.cardBg }]}>
+                  <Text style={[styles.ratingLabel, { color: theme.textSecondary }]}>Career XP</Text>
+                  <Text style={[styles.ratingValue, { color: theme.textPrimary }]}>⚡ {totalCareerXP.toLocaleString()}</Text>
+                </View>
+
+                <View style={[styles.ratingCard, { backgroundColor: theme.cardBg }]}>
+                  <Text style={[styles.ratingLabel, { color: theme.textSecondary }]}>Peak Rating</Text>
+                  <Text style={[styles.ratingValue, { color: theme.textPrimary }]}>🏆 {peakSkillScore.toLocaleString()}</Text>
+                </View>
+              </View>
+
+              <Pressable
+                style={[styles.leaderboardBtn, { backgroundColor: theme.accentBtn }]}
+                onPress={openLeaderboardModal}
+              >
+                <Text style={styles.leaderboardBtnText}>🌍 View Global & Friends Leaderboard</Text>
+              </Pressable>
+
+              {/* Visual Career Analytics Section */}
               <Text style={[styles.sectionHeading, { color: theme.textPrimary }]}>
-                Performance Overview
+                Career Analytics & Win Rates
+              </Text>
+
+              <View style={[styles.statCategoryCard, { backgroundColor: theme.cardBg, marginBottom: 16 }]}>
+                {analyticsData.map((item) => (
+                  <View key={item.difficulty} style={{ marginBottom: 12 }}>
+                    <View style={{ flexDirection: 'row', justifyContent: 'space-between', marginBottom: 4 }}>
+                      <Text style={[styles.statRowLabel, { color: theme.textPrimary }]}>
+                        {item.difficulty}
+                      </Text>
+                      <Text style={[styles.statRowValue, { color: theme.textSecondary }]}>
+                        {item.winRate}% ({item.won}/{item.started} Won) • Avg: {item.avgBestTime > 0 ? formatTime(item.avgBestTime) : '--:--'}
+                      </Text>
+                    </View>
+                    {/* Visual Progress Bar */}
+                    <View style={styles.analyticsBarTrack}>
+                      <View
+                        style={[
+                          styles.analyticsBarFill,
+                          {
+                            width: `${Math.max(item.winRate, 2)}%`,
+                            backgroundColor:
+                              item.difficulty === 'EASY'
+                                ? '#10B981'
+                                : item.difficulty === 'MEDIUM'
+                                ? '#3B82F6'
+                                : item.difficulty === 'HARD'
+                                ? '#F59E0B'
+                                : '#EF4444',
+                          },
+                        ]}
+                      />
+                    </View>
+                  </View>
+                ))}
+              </View>
+
+              <Text style={[styles.sectionHeading, { color: theme.textPrimary }]}>
+                Grid Performance Overview
               </Text>
               {BOARD_LAYOUTS.map((opt) => {
                 const diffs: Difficulty[] = ['easy', 'medium', 'hard', 'expert'];
@@ -1285,6 +1756,7 @@ function MainApp() {
                         won: 0,
                         bestTime: null,
                         streak: 0,
+                        totalScore: 0,
                       };
                       return (
                         <View key={d} style={styles.statRowItem}>
@@ -1297,8 +1769,7 @@ function MainApp() {
                             {d.toUpperCase()}
                           </Text>
                           <Text style={[styles.statRowValue, { color: theme.textPrimary }]}>
-                            Won: {cs.won}/{cs.started} • Streak: 🔥{cs.streak} • Best:{' '}
-                            {cs.bestTime ? formatTime(cs.bestTime) : '--:--'}
+                            Won: {cs.won}/{cs.started} • 🔥{cs.streak} • Best: {cs.bestTime ? formatTime(cs.bestTime) : '--:--'} • {cs.totalScore || 0} XP
                           </Text>
                         </View>
                       );
@@ -1310,38 +1781,127 @@ function MainApp() {
           )}
 
           {tab === 'profile' && (
-            <View style={styles.profileContent}>
+            <ScrollView
+              contentContainerStyle={{ padding: 20, paddingBottom: 80, alignItems: 'center' }}
+              showsVerticalScrollIndicator={false}
+            >
               <View style={styles.avatarCircle}>
-                {avatarUrl ? (
+                {avatarUrl && avatarUrl.startsWith('http') ? (
                   <Image
                     source={{ uri: avatarUrl }}
                     style={styles.avatarImage}
                     resizeMode="cover"
                   />
                 ) : (
-                  <Text style={styles.avatarText}>{user ? '✨' : '👤'}</Text>
+                  <Text style={styles.avatarText}>{avatarUrl || (user ? '✨' : '👤')}</Text>
                 )}
               </View>
               <Text style={[styles.profileName, { color: theme.textPrimary }]}>
-                {user?.user_metadata?.full_name || user?.user_metadata?.name || (user ? 'Ramcraft Player' : 'Guest Player')}
+                {activeDisplayName}
               </Text>
               <Text style={[styles.profileId, { color: theme.textSecondary }]}>
                 {user ? user.email : `Device ID: ${deviceId}`}
               </Text>
 
+              <Pressable
+                style={[styles.editProfileBtn, { borderColor: theme.blockBg }]}
+                onPress={() => {
+                  setCustomName(activeDisplayName);
+                  setProfileModalOpen(true);
+                }}
+              >
+                <Text style={[styles.editProfileBtnText, { color: theme.userText }]}>
+                  ✏ Edit Profile & Avatar
+                </Text>
+              </Pressable>
+
+              {/* Achievements Showcase Section */}
+              <View style={[styles.achievementsCard, { backgroundColor: theme.cardBg }]}>
+                <View style={styles.achievementsHeader}>
+                  <Text style={[styles.profileCardTitle, { color: theme.textPrimary }]}>
+                    Trophies & Achievements
+                  </Text>
+                  <Text style={{ fontSize: 12, fontWeight: '700', color: '#EAB308' }}>
+                    {unlockedAchievements.length}/{ACHIEVEMENTS_METADATA.length} Unlocked
+                  </Text>
+                </View>
+
+                {ACHIEVEMENTS_METADATA.map((badge) => {
+                  const isUnlocked = unlockedAchievements.includes(badge.id);
+                  return (
+                    <View
+                      key={badge.id}
+                      style={[
+                        styles.badgeRow,
+                        { borderBottomColor: theme.blockBg, opacity: isUnlocked ? 1 : 0.4 },
+                      ]}
+                    >
+                      <Text style={styles.badgeIcon}>{badge.icon}</Text>
+                      <View style={{ flex: 1, paddingHorizontal: 10 }}>
+                        <Text style={[styles.badgeTitle, { color: theme.textPrimary }]}>
+                          {badge.title} {isUnlocked && '✓'}
+                        </Text>
+                        <Text style={[styles.badgeDesc, { color: theme.textSecondary }]}>
+                          {badge.description}
+                        </Text>
+                      </View>
+                      <Text style={[styles.badgeTier, { color: badge.tier === 'diamond' ? '#38BDF8' : badge.tier === 'gold' ? '#FACC15' : badge.tier === 'silver' ? '#CBD5E1' : '#D97706' }]}>
+                        {badge.tier.toUpperCase()}
+                      </Text>
+                    </View>
+                  );
+                })}
+              </View>
+
+              {/* Daily Streak Card */}
               <View
                 style={[styles.profileCard, { backgroundColor: theme.cardBg }]}
               >
                 <Text style={[styles.profileCardTitle, { color: theme.textPrimary }]}>
-                  Account Status
+                  Daily Challenge Streaks
                 </Text>
-                <Text
-                  style={[styles.profileCardBody, { color: theme.textSecondary }]}
+                <Text style={[styles.profileCardBody, { color: theme.textSecondary }]}>
+                  Current Daily Streak: 🔥 {dailyStreak.currentStreak} Days{'\n'}
+                  Best Daily Streak: 🏆 {dailyStreak.bestStreak} Days{'\n'}
+                  Total Challenges Completed: ⭐ {dailyStreak.totalCompleted}
+                </Text>
+              </View>
+
+              {/* Data Management & Compliance Tools */}
+              <View style={[styles.profileCard, { backgroundColor: theme.cardBg }]}>
+                <Text style={[styles.profileCardTitle, { color: theme.textPrimary }]}>
+                  Data Management & Cloud Tools
+                </Text>
+
+                <Pressable
+                  style={[styles.managementActionBtn, { backgroundColor: theme.appBg }]}
+                  onPress={handleForceSync}
+                  disabled={syncingNow}
                 >
-                  {user
-                    ? 'Connected to Supabase Cloud. Your statistics, streak, and saved games are synced to your account.'
-                    : 'Playing as guest. Your progress is tracked via Android Device ID (AAID). Sign in with Google to sync across devices.'}
-                </Text>
+                  <Text style={[styles.managementActionText, { color: theme.textPrimary }]}>
+                    {syncingNow ? '🔄 Syncing...' : '🔄 Force Sync Now'}
+                  </Text>
+                </Pressable>
+
+                <Pressable
+                  style={[styles.managementActionBtn, { backgroundColor: theme.appBg }]}
+                  onPress={handleExportData}
+                >
+                  <Text style={[styles.managementActionText, { color: theme.textPrimary }]}>
+                    📥 Export All Account Data (JSON)
+                  </Text>
+                </Pressable>
+
+                {user && (
+                  <Pressable
+                    style={[styles.managementActionBtn, { backgroundColor: '#FEE2E2', marginTop: 8 }]}
+                    onPress={handleDeleteCloudData}
+                  >
+                    <Text style={[styles.managementActionText, { color: '#DC2626' }]}>
+                      🗑 Permanently Delete Cloud Data
+                    </Text>
+                  </Pressable>
+                )}
               </View>
 
               <Pressable
@@ -1360,7 +1920,7 @@ function MainApp() {
                     : 'Sign In with Google'}
                 </Text>
               </Pressable>
-            </View>
+            </ScrollView>
           )}
 
           <View
@@ -1443,6 +2003,344 @@ function MainApp() {
           </View>
         </View>
       )}
+
+      {/* Edit Profile Customization Modal */}
+      <Modal visible={profileModalOpen} animationType="fade" transparent>
+        <View style={styles.modalOverlay}>
+          <View style={[styles.modalBox, { backgroundColor: theme.cardBg }]}>
+            <View style={styles.modalHeader}>
+              <Text style={[styles.modalTitle, { color: theme.textPrimary }]}>
+                Customize Public Profile
+              </Text>
+              <Pressable onPress={() => setProfileModalOpen(false)}>
+                <Text style={[styles.closeModalText, { color: theme.textSecondary }]}>✕</Text>
+              </Pressable>
+            </View>
+
+            <Text style={[styles.settingLabel, { color: theme.textPrimary }]}>Gamer Display Name</Text>
+            <TextInput
+              style={[styles.profileInput, { color: theme.textPrimary, borderColor: theme.blockBg }]}
+              value={customName}
+              onChangeText={setCustomName}
+              placeholder="e.g. SudokuMaster99"
+              placeholderTextColor={theme.textSecondary}
+              maxLength={20}
+            />
+
+            <Text style={[styles.settingLabel, { color: theme.textPrimary, marginTop: 12 }]}>Choose Avatar Emoji</Text>
+            <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginVertical: 8 }}>
+              {AVATAR_PRESETS.map((icon) => (
+                <Pressable
+                  key={icon}
+                  onPress={() => setCustomAvatar(icon)}
+                  style={[
+                    styles.avatarPresetBtn,
+                    customAvatar === icon && { borderColor: theme.userText, borderWidth: 2 },
+                  ]}
+                >
+                  <Text style={{ fontSize: 24 }}>{icon}</Text>
+                </Pressable>
+              ))}
+            </View>
+
+            <Pressable
+              style={[styles.playButton, { backgroundColor: theme.accentBtn, marginTop: 12 }]}
+              onPress={handleSaveProfile}
+            >
+              <Text style={styles.playButtonText}>Save Profile</Text>
+            </Pressable>
+          </View>
+        </View>
+      </Modal>
+
+      {/* Monthly Daily Challenge Calendar Modal */}
+      <Modal visible={calendarModalOpen} animationType="slide" transparent>
+        <View style={styles.modalOverlay}>
+          <View style={[styles.modalBox, { backgroundColor: theme.cardBg, maxHeight: '90%' }]}>
+            <View style={styles.modalHeader}>
+              <View>
+                <Text style={[styles.modalTitle, { color: theme.textPrimary }]}>
+                  📅 Daily Challenges
+                </Text>
+                <Text style={[styles.calendarSubHeading, { color: theme.textSecondary }]}>
+                  {new Date().toLocaleString('default', { month: 'long', year: 'numeric' })}
+                </Text>
+              </View>
+              <Pressable onPress={() => setCalendarModalOpen(false)}>
+                <Text style={[styles.closeModalText, { color: theme.textSecondary }]}>
+                  ✕
+                </Text>
+              </Pressable>
+            </View>
+
+            {/* Monthly Crown Milestone Showcase */}
+            <View style={styles.crownMilestoneBox}>
+              <Text style={{ fontSize: 20 }}>
+                {monthlyCrownTier === 'gold' ? '👑' : monthlyCrownTier === 'silver' ? '🥈' : monthlyCrownTier === 'bronze' ? '🥉' : '🔒'}
+              </Text>
+              <View style={{ flex: 1, paddingLeft: 8 }}>
+                <Text style={[styles.crownMilestoneTitle, { color: theme.textPrimary }]}>
+                  {monthlyCrownTier === 'gold' ? 'Gold Crown Achieved!' : monthlyCrownTier === 'silver' ? 'Silver Crown Achieved!' : monthlyCrownTier === 'bronze' ? 'Bronze Crown Achieved!' : 'Monthly Crown in Progress'}
+                </Text>
+                <Text style={[styles.crownMilestoneSub, { color: theme.textSecondary }]}>
+                  {completedCountInMonth} days completed (10d 🥉 • 20d 🥈 • {daysInMonth}d 👑)
+                </Text>
+              </View>
+            </View>
+
+            <View style={styles.calendarStreakBanner}>
+              <View style={styles.calendarStreakItem}>
+                <Text style={styles.calendarStreakVal}>🔥 {dailyStreak.currentStreak}</Text>
+                <Text style={styles.calendarStreakLabel}>Current Streak</Text>
+              </View>
+              <View style={styles.calendarStreakItem}>
+                <Text style={styles.calendarStreakVal}>🏆 {dailyStreak.bestStreak}</Text>
+                <Text style={styles.calendarStreakLabel}>Best Streak</Text>
+              </View>
+              <View style={styles.calendarStreakItem}>
+                <Text style={styles.calendarStreakVal}>⭐ {dailyStreak.totalCompleted}</Text>
+                <Text style={styles.calendarStreakLabel}>Completed</Text>
+              </View>
+            </View>
+
+            <View style={styles.calendarDaysHeader}>
+              {['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'].map((d) => (
+                <Text key={d} style={[styles.calendarDayHeadText, { color: theme.textSecondary }]}>
+                  {d}
+                </Text>
+              ))}
+            </View>
+
+            <View style={styles.calendarGrid}>
+              {Array.from({ length: firstDayIndex }).map((_, i) => (
+                <View key={`empty-${i}`} style={styles.calendarSlotEmpty} />
+              ))}
+
+              {Array.from({ length: daysInMonth }).map((_, i) => {
+                const dayNum = i + 1;
+                const dStr = `${year}-${String(month + 1).padStart(2, '0')}-${String(dayNum).padStart(2, '0')}`;
+                const isWonDay = monthlyChallenges[dStr]?.status === 'won';
+                const isToday = dStr === todayStr;
+                const isPastOrToday = dayNum <= now.getDate();
+
+                return (
+                  <Pressable
+                    key={dStr}
+                    disabled={!isPastOrToday}
+                    onPress={() => startDailyGame(dStr)}
+                    style={[
+                      styles.calendarDaySlot,
+                      { backgroundColor: theme.appBg },
+                      isWonDay && { backgroundColor: '#059669' },
+                      isToday && !isWonDay && { borderColor: '#3B82F6', borderWidth: 2 },
+                      !isPastOrToday && { opacity: 0.3 },
+                    ]}
+                  >
+                    <Text
+                      style={[
+                        styles.calendarDayNum,
+                        { color: isWonDay ? '#FFFFFF' : theme.textPrimary },
+                      ]}
+                    >
+                      {dayNum}
+                    </Text>
+                    {isWonDay && <Text style={styles.calendarStar}>⭐</Text>}
+                  </Pressable>
+                );
+              })}
+            </View>
+
+            <Pressable
+              style={[styles.playButton, { backgroundColor: theme.accentBtn, marginTop: 14 }]}
+              onPress={() => startDailyGame(todayStr)}
+            >
+              <Text style={styles.playButtonText}>Play Today's Challenge</Text>
+            </Pressable>
+          </View>
+        </View>
+      </Modal>
+
+      {/* Global & Friends Leaderboard Modal */}
+      <Modal visible={leaderboardOpen} animationType="slide" transparent>
+        <View style={styles.modalOverlay}>
+          <View style={[styles.modalBox, { backgroundColor: theme.cardBg, maxHeight: '90%' }]}>
+            <View style={styles.modalHeader}>
+              <Text style={[styles.modalTitle, { color: theme.textPrimary }]}>
+                {friendsOnly ? '👥 Friends Leaderboard' : '🌍 Global Leaderboard'}
+              </Text>
+              <Pressable onPress={() => setLeaderboardOpen(false)}>
+                <Text style={[styles.closeModalText, { color: theme.textSecondary }]}>
+                  ✕
+                </Text>
+              </Pressable>
+            </View>
+
+            {/* Scope Toggle: Global vs Friends */}
+            <View style={styles.optionRow}>
+              <Pressable
+                onPress={() => setFriendsOnly(false)}
+                style={[styles.segmentBtn, !friendsOnly && styles.segmentBtnActive]}
+              >
+                <Text style={[styles.segmentText, !friendsOnly && styles.segmentTextActive]}>
+                  🌍 Global
+                </Text>
+              </Pressable>
+              <Pressable
+                onPress={() => setFriendsOnly(true)}
+                style={[styles.segmentBtn, friendsOnly && styles.segmentBtnActive]}
+              >
+                <Text style={[styles.segmentText, friendsOnly && styles.segmentTextActive]}>
+                  👥 Friends
+                </Text>
+              </Pressable>
+            </View>
+
+            {/* Timeframe Tabs: All-Time, Monthly, Weekly */}
+            <View style={[styles.optionRow, { marginTop: 8 }]}>
+              {(['all_time', 'monthly', 'weekly'] as Timeframe[]).map((tf) => (
+                <Pressable
+                  key={tf}
+                  onPress={() => setLeaderboardTimeframe(tf)}
+                  style={[
+                    styles.segmentBtnSmall,
+                    leaderboardTimeframe === tf && styles.segmentBtnSmallActive,
+                  ]}
+                >
+                  <Text
+                    style={[
+                      styles.segmentSmallText,
+                      leaderboardTimeframe === tf && styles.segmentSmallTextActive,
+                    ]}
+                  >
+                    {tf === 'all_time' ? 'All-Time' : tf === 'monthly' ? 'This Month' : 'This Week'}
+                  </Text>
+                </Pressable>
+              ))}
+            </View>
+
+            {/* Metric Toggle: Career XP vs Peak Rating */}
+            <View style={[styles.optionRow, { marginTop: 8 }]}>
+              <Pressable
+                onPress={() => setLeaderboardType('career')}
+                style={[
+                  styles.segmentBtnSmall,
+                  leaderboardType === 'career' && styles.segmentBtnSmallActive,
+                ]}
+              >
+                <Text
+                  style={[
+                    styles.segmentSmallText,
+                    leaderboardType === 'career' && styles.segmentSmallTextActive,
+                  ]}
+                >
+                  ⚡ Career XP
+                </Text>
+              </Pressable>
+              <Pressable
+                onPress={() => setLeaderboardType('peak')}
+                style={[
+                  styles.segmentBtnSmall,
+                  leaderboardType === 'peak' && styles.segmentBtnSmallActive,
+                ]}
+              >
+                <Text
+                  style={[
+                    styles.segmentSmallText,
+                    leaderboardType === 'peak' && styles.segmentBtnSmallActive,
+                  ]}
+                >
+                  🏆 Peak Rating
+                </Text>
+              </Pressable>
+            </View>
+
+            {loadingLeaderboard ? (
+              <Text style={[styles.emptyModalText, { color: theme.textSecondary }]}>
+                Loading rankings...
+              </Text>
+            ) : leaderboardData.length === 0 ? (
+              <Text style={[styles.emptyModalText, { color: theme.textSecondary }]}>
+                {friendsOnly
+                  ? 'No friend activity recorded for this period. Follow other players using the button on their rank card!'
+                  : 'No games recorded yet for this period. Win a game to take the #1 spot!'}
+              </Text>
+            ) : (
+              <ScrollView style={{ marginTop: 10 }}>
+                {leaderboardData.map((player) => (
+                  <View
+                    key={player.userId}
+                    style={[
+                      styles.leaderboardRow,
+                      {
+                        borderBottomColor: theme.blockBg,
+                        backgroundColor:
+                          user?.id === player.userId
+                            ? theme.isDark
+                              ? '#1E3A8A'
+                              : '#E0F2FE'
+                            : 'transparent',
+                      },
+                    ]}
+                  >
+                    <View style={styles.leaderboardRankCol}>
+                      <Text
+                        style={[
+                          styles.leaderboardRankText,
+                          {
+                            color:
+                              player.rank === 1
+                                ? '#EAB308'
+                                : player.rank === 2
+                                ? '#94A3B8'
+                                : player.rank === 3
+                                ? '#B45309'
+                                : theme.textSecondary,
+                          },
+                        ]}
+                      >
+                        {player.rank === 1 ? '🥇' : player.rank === 2 ? '🥈' : player.rank === 3 ? '🥉' : `#${player.rank}`}
+                      </Text>
+                    </View>
+
+                    <View style={{ flex: 1, paddingHorizontal: 6 }}>
+                      <Text
+                        numberOfLines={1}
+                        style={[styles.leaderboardName, { color: theme.textPrimary }]}>
+                        {player.displayName} {user?.id === player.userId && '(You)'}
+                      </Text>
+                      <Text style={[styles.leaderboardSub, { color: theme.textSecondary }]}>
+                        Won: {player.gamesWon} games
+                      </Text>
+                    </View>
+
+                    <View style={{ alignItems: 'flex-end', gap: 4 }}>
+                      <Text style={[styles.leaderboardScore, { color: theme.userText }]}>
+                        {leaderboardType === 'career'
+                          ? `${player.totalScore.toLocaleString()} XP`
+                          : `${player.peakScore.toLocaleString()} pts`}
+                      </Text>
+
+                      {user && user.id !== player.userId && (
+                        <Pressable
+                          onPress={() => handleToggleFollow(player.userId, Boolean(player.isFollowing))}
+                          style={[
+                            styles.followBtn,
+                            player.isFollowing && styles.followBtnActive,
+                          ]}
+                        >
+                          <Text style={[styles.followBtnText, player.isFollowing && styles.followBtnTextActive]}>
+                            {player.isFollowing ? 'Following' : '+ Follow'}
+                          </Text>
+                        </Pressable>
+                      )}
+                    </View>
+                  </View>
+                ))}
+              </ScrollView>
+            )}
+          </View>
+        </View>
+      </Modal>
 
       {/* Favorites Modal */}
       <Modal visible={favoritesOpen} animationType="slide" transparent>
@@ -1743,11 +2641,9 @@ function MainApp() {
               </View>
 
               <View style={[styles.statCategoryCard, { backgroundColor: theme.appBg }]}>
-                <Text style={[styles.switchTitle, { color: theme.textPrimary }]}>4. Solvers & Assists</Text>
+                <Text style={[styles.switchTitle, { color: theme.textPrimary }]}>4. Scoring & Rankings</Text>
                 <Text style={[styles.switchSub, { color: theme.textSecondary, marginTop: 4 }]}>
-                  • <Text style={{ fontWeight: '700', color: theme.textPrimary }}>Smart Hints (💡):</Text> Highlights logical deductions and explains why a move belongs there.{'\n'}
-                  • <Text style={{ fontWeight: '700', color: theme.textPrimary }}>Notes Mode (✎):</Text> Pencil in candidate numbers.{'\n'}
-                  • <Text style={{ fontWeight: '700', color: theme.textPrimary }}>Highlight Matches:</Text> Tap any placed number to see identical digits on the board.
+                  Earn XP based on board size and difficulty multiplier! Solving faster than the average target grants up to a 2.0x bonus score. Check the Global Leaderboard in Stats!
                 </Text>
               </View>
             </ScrollView>
@@ -1786,61 +2682,142 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'space-between',
     paddingHorizontal: 20,
-    paddingBottom: 10,
+    paddingBottom: 2,
   },
   appHeaderTitle: {
-    fontSize: 24,
+    fontSize: 18,
     fontWeight: '800',
+    letterSpacing: 0.5,
   },
   topRightActions: {
     flexDirection: 'row',
     gap: 8,
   },
   iconCircle: {
-    width: 38,
-    height: 38,
-    borderRadius: 19,
+    width: 36,
+    height: 36,
+    borderRadius: 18,
     backgroundColor: 'rgba(128,128,128,0.15)',
     alignItems: 'center',
     justifyContent: 'center',
   },
   iconCircleText: {
-    fontSize: 18,
+    fontSize: 16,
   },
-  homeScrollContent: {
-    flexGrow: 1,
-    justifyContent: 'center',
+  achievementToast: {
+    position: 'absolute',
+    top: 50,
+    alignSelf: 'center',
+    zIndex: 9999,
+    flexDirection: 'row',
     alignItems: 'center',
-    paddingVertical: 16,
-    paddingHorizontal: 20,
+    backgroundColor: '#1E293B',
+    borderColor: '#FACC15',
+    borderWidth: 1.5,
+    borderRadius: 12,
+    paddingVertical: 10,
+    paddingHorizontal: 16,
+    maxWidth: 360,
+    elevation: 8,
+    shadowColor: '#000',
+    shadowOpacity: 0.25,
+    shadowRadius: 6,
   },
-  homeCardWrapper: {
+  achievementToastIcon: {
+    fontSize: 26,
+    marginRight: 10,
+  },
+  achievementToastBadge: {
+    fontSize: 10,
+    fontWeight: '800',
+    color: '#FACC15',
+    letterSpacing: 0.5,
+  },
+  achievementToastTitle: {
+    fontSize: 14,
+    fontWeight: '700',
+    color: '#FFFFFF',
+    marginTop: 1,
+  },
+  homeFixedContainer: {
+    flex: 1,
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    paddingHorizontal: 20,
+    paddingTop: 0,
+    paddingBottom: 10,
+  },
+  dailyCard: {
+    width: '100%',
+    maxWidth: 400,
+    borderRadius: 12,
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+    elevation: 3,
+  },
+  dailyCardHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 6,
+  },
+  dailyCardBadge: {
+    color: '#FDE047',
+    fontSize: 11,
+    fontWeight: '800',
+    letterSpacing: 0.5,
+  },
+  dailyStreakTag: {
+    color: '#FFFFFF',
+    fontSize: 12,
+    fontWeight: '700',
+  },
+  dailyCardBtnRow: {
+    flexDirection: 'row',
+    gap: 8,
+  },
+  dailyPlayBtn: {
+    flex: 1,
+    backgroundColor: '#FFFFFF',
+    paddingVertical: 7,
+    borderRadius: 8,
+    alignItems: 'center',
+  },
+  dailyPlayBtnText: {
+    color: '#111827',
+    fontSize: 12,
+    fontWeight: '700',
+  },
+  dailyCalendarBtn: {
+    backgroundColor: 'rgba(255,255,255,0.2)',
+    paddingVertical: 7,
+    paddingHorizontal: 12,
+    borderRadius: 8,
+    alignItems: 'center',
+  },
+  dailyCalendarBtnText: {
+    color: '#FFFFFF',
+    fontSize: 12,
+    fontWeight: '700',
+  },
+  middleSection: {
     width: '100%',
     maxWidth: 400,
     alignItems: 'center',
+    marginVertical: 'auto',
   },
-  logoImage: {
-    width: 80,
-    height: 80,
-    borderRadius: 20,
-    marginBottom: 8,
-  },
-  title: {
-    fontSize: 28,
-    fontWeight: '800',
-    letterSpacing: 2,
-  },
-  subtitle: {
-    fontSize: 13,
-    marginBottom: 16,
+  centerLogoImage: {
+    width: 100,
+    height: 100,
+    borderRadius: 22,
+    marginBottom: 10,
   },
   resumeCard: {
     width: '100%',
     backgroundColor: '#005BBB',
-    paddingVertical: 12,
-    paddingHorizontal: 16,
+    paddingVertical: 8,
+    paddingHorizontal: 14,
     borderRadius: 12,
-    marginBottom: 14,
   },
   resumeHeader: {
     flexDirection: 'row',
@@ -1849,12 +2826,12 @@ const styles = StyleSheet.create({
     marginBottom: 2,
   },
   resumeTitle: {
-    fontSize: 16,
+    fontSize: 14,
     fontWeight: '700',
     color: '#FFFFFF',
   },
   resumeTime: {
-    fontSize: 15,
+    fontSize: 13,
     fontWeight: '600',
     color: '#E0F2FE',
   },
@@ -1863,12 +2840,17 @@ const styles = StyleSheet.create({
     color: '#BAE6FD',
     fontWeight: '500',
   },
+  bottomControlsSection: {
+    width: '100%',
+    maxWidth: 400,
+    alignItems: 'center',
+  },
   playButton: {
     width: '100%',
-    paddingVertical: 14,
+    paddingVertical: 12,
     borderRadius: 10,
     alignItems: 'center',
-    marginTop: 10,
+    marginTop: 6,
   },
   playButtonText: {
     color: '#FFFFFF',
@@ -1879,10 +2861,56 @@ const styles = StyleSheet.create({
     padding: 20,
     paddingBottom: 80,
   },
-  sectionHeading: {
-    fontSize: 18,
+  ratingOverviewRow: {
+    flexDirection: 'row',
+    gap: 12,
+    marginBottom: 12,
+  },
+  ratingCard: {
+    flex: 1,
+    padding: 16,
+    borderRadius: 12,
+    alignItems: 'center',
+    elevation: 2,
+  },
+  ratingLabel: {
+    fontSize: 12,
     fontWeight: '700',
-    marginBottom: 14,
+    textTransform: 'uppercase',
+    letterSpacing: 0.5,
+  },
+  ratingValue: {
+    fontSize: 20,
+    fontWeight: '800',
+    marginTop: 4,
+  },
+  leaderboardBtn: {
+    width: '100%',
+    paddingVertical: 12,
+    borderRadius: 10,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginBottom: 16,
+  },
+  leaderboardBtnText: {
+    color: '#FFFFFF',
+    fontSize: 14,
+    fontWeight: '700',
+  },
+  sectionHeading: {
+    fontSize: 17,
+    fontWeight: '800',
+    marginBottom: 10,
+  },
+  analyticsBarTrack: {
+    height: 8,
+    borderRadius: 4,
+    backgroundColor: 'rgba(128,128,128,0.2)',
+    overflow: 'hidden',
+  },
+  analyticsBarFill: {
+    height: '100%',
+    borderRadius: 4,
   },
   statCategoryCard: {
     padding: 16,
@@ -1908,11 +2936,130 @@ const styles = StyleSheet.create({
     fontSize: 13,
     fontWeight: '500',
   },
-  profileContent: {
+  leaderboardRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingVertical: 10,
+    borderBottomWidth: 1,
+    borderRadius: 8,
+  },
+  leaderboardRankCol: {
+    width: 34,
+    alignItems: 'center',
+  },
+  leaderboardRankText: {
+    fontSize: 15,
+    fontWeight: '800',
+  },
+  leaderboardName: {
+    fontSize: 13,
+    fontWeight: '700',
+  },
+  leaderboardSub: {
+    fontSize: 11,
+    marginTop: 2,
+  },
+  leaderboardScore: {
+    fontSize: 13,
+    fontWeight: '800',
+  },
+  followBtn: {
+    backgroundColor: '#3B82F6',
+    paddingVertical: 3,
+    paddingHorizontal: 8,
+    borderRadius: 6,
+  },
+  followBtnActive: {
+    backgroundColor: '#6B7280',
+  },
+  followBtnText: {
+    color: '#FFFFFF',
+    fontSize: 10,
+    fontWeight: '700',
+  },
+  followBtnTextActive: {
+    color: '#E5E7EB',
+  },
+  calendarSubHeading: {
+    fontSize: 12,
+    marginTop: 2,
+  },
+  crownMilestoneBox: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: 'rgba(234, 179, 8, 0.15)',
+    borderColor: 'rgba(234, 179, 8, 0.4)',
+    borderWidth: 1,
+    borderRadius: 10,
+    padding: 10,
+    marginBottom: 10,
+  },
+  crownMilestoneTitle: {
+    fontSize: 13,
+    fontWeight: '700',
+  },
+  crownMilestoneSub: {
+    fontSize: 11,
+    marginTop: 1,
+  },
+  calendarStreakBanner: {
+    flexDirection: 'row',
+    justifyContent: 'space-around',
+    backgroundColor: 'rgba(128,128,128,0.1)',
+    borderRadius: 10,
+    paddingVertical: 10,
+    marginVertical: 8,
+  },
+  calendarStreakItem: {
+    alignItems: 'center',
+  },
+  calendarStreakVal: {
+    fontSize: 16,
+    fontWeight: '800',
+    color: '#D97706',
+  },
+  calendarStreakLabel: {
+    fontSize: 10,
+    fontWeight: '600',
+    color: '#6B7280',
+    marginTop: 2,
+  },
+  calendarDaysHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    marginBottom: 6,
+  },
+  calendarDayHeadText: {
     flex: 1,
+    textAlign: 'center',
+    fontSize: 11,
+    fontWeight: '700',
+  },
+  calendarGrid: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+  },
+  calendarSlotEmpty: {
+    width: `${100 / 7}%`,
+    aspectRatio: 1,
+  },
+  calendarDaySlot: {
+    width: `${100 / 7}%`,
+    aspectRatio: 1,
     alignItems: 'center',
     justifyContent: 'center',
-    padding: 24,
+    borderRadius: 6,
+    marginVertical: 2,
+    position: 'relative',
+  },
+  calendarDayNum: {
+    fontSize: 12,
+    fontWeight: '700',
+  },
+  calendarStar: {
+    fontSize: 10,
+    position: 'absolute',
+    bottom: 2,
   },
   avatarCircle: {
     width: 90,
@@ -1922,7 +3069,7 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
     overflow: 'hidden',
-    marginBottom: 12,
+    marginBottom: 10,
   },
   avatarImage: {
     width: '100%',
@@ -1937,14 +3084,77 @@ const styles = StyleSheet.create({
   },
   profileId: {
     fontSize: 14,
-    marginBottom: 24,
+    marginBottom: 10,
+  },
+  editProfileBtn: {
+    paddingVertical: 6,
+    paddingHorizontal: 16,
+    borderRadius: 20,
+    borderWidth: 1,
+    marginBottom: 16,
+  },
+  editProfileBtnText: {
+    fontSize: 12,
+    fontWeight: '700',
+  },
+  profileInput: {
+    width: '100%',
+    borderWidth: 1,
+    borderRadius: 8,
+    padding: 10,
+    fontSize: 15,
+    marginTop: 4,
+  },
+  avatarPresetBtn: {
+    width: 44,
+    height: 44,
+    borderRadius: 22,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: 'rgba(128,128,128,0.15)',
+  },
+  achievementsCard: {
+    width: '100%',
+    maxWidth: 360,
+    padding: 16,
+    borderRadius: 12,
+    marginBottom: 16,
+    elevation: 2,
+  },
+  achievementsHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 12,
+  },
+  badgeRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingVertical: 10,
+    borderBottomWidth: 1,
+  },
+  badgeIcon: {
+    fontSize: 24,
+  },
+  badgeTitle: {
+    fontSize: 14,
+    fontWeight: '700',
+  },
+  badgeDesc: {
+    fontSize: 11,
+    marginTop: 2,
+  },
+  badgeTier: {
+    fontSize: 10,
+    fontWeight: '800',
+    letterSpacing: 0.5,
   },
   profileCard: {
     width: '100%',
     maxWidth: 360,
     padding: 16,
     borderRadius: 12,
-    marginBottom: 24,
+    marginBottom: 16,
   },
   profileCardTitle: {
     fontSize: 16,
@@ -1954,6 +3164,18 @@ const styles = StyleSheet.create({
   profileCardBody: {
     fontSize: 13,
     lineHeight: 18,
+  },
+  managementActionBtn: {
+    width: '100%',
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+    borderRadius: 8,
+    alignItems: 'center',
+    marginTop: 8,
+  },
+  managementActionText: {
+    fontSize: 13,
+    fontWeight: '700',
   },
   loginBtn: {
     width: '100%',
@@ -2003,6 +3225,10 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'center',
+  },
+  gameHeaderCenterTitle: {
+    fontSize: 13,
+    fontWeight: '700',
   },
   backButton: {
     paddingVertical: 4,
@@ -2099,7 +3325,7 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'center',
-    marginBottom: 16,
+    marginBottom: 12,
   },
   modalTitle: {
     fontSize: 18,
@@ -2110,10 +3336,10 @@ const styles = StyleSheet.create({
     fontWeight: '700',
   },
   emptyModalText: {
-    fontSize: 14,
+    fontSize: 13,
     textAlign: 'center',
-    paddingVertical: 20,
-    lineHeight: 20,
+    paddingVertical: 24,
+    lineHeight: 18,
   },
   favItem: {
     flexDirection: 'row',
@@ -2137,11 +3363,11 @@ const styles = StyleSheet.create({
   },
   optionRow: {
     flexDirection: 'row',
-    gap: 10,
+    gap: 8,
   },
   segmentBtn: {
     flex: 1,
-    paddingVertical: 10,
+    paddingVertical: 8,
     alignItems: 'center',
     borderRadius: 8,
     backgroundColor: '#E5E7EB',
@@ -2150,12 +3376,31 @@ const styles = StyleSheet.create({
     backgroundColor: '#111827',
   },
   segmentText: {
-    fontSize: 14,
-    fontWeight: '600',
+    fontSize: 13,
+    fontWeight: '700',
     color: '#374151',
   },
   segmentTextActive: {
     color: '#FFFFFF',
+  },
+  segmentBtnSmall: {
+    flex: 1,
+    paddingVertical: 6,
+    alignItems: 'center',
+    borderRadius: 6,
+    backgroundColor: '#E5E7EB',
+  },
+  segmentBtnSmallActive: {
+    backgroundColor: '#2563EB',
+  },
+  segmentSmallText: {
+    fontSize: 11,
+    fontWeight: '600',
+    color: '#4B5563',
+  },
+  segmentSmallTextActive: {
+    color: '#FFFFFF',
+    fontWeight: '700',
   },
   palettesRow: {
     flexDirection: 'row',
