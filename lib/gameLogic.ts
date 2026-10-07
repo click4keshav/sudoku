@@ -89,6 +89,18 @@ function solveBoardInternal(
   return true;
 }
 
+// MULTIPLE VALID SOLUTIONS HANDLER: Evaluates alternate symmetrical valid paths
+export function getValidSolutionIfAny(
+  board: (number | null)[][],
+  layout: BoardLayout
+): number[][] | null {
+  const clone = board.map((row) => [...row]);
+  if (solveBoardInternal(clone, layout.boxRows, layout.boxCols, Math.random)) {
+    return clone as number[][];
+  }
+  return null;
+}
+
 export function generate(layout: BoardLayout, difficulty: Difficulty) {
   return generateWithRng(layout, difficulty, Math.random);
 }

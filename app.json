@@ -13,10 +13,11 @@
       "backgroundColor": "#ffffff"
     },
     "ios": {
-      "supportsTablet": true
+      "supportsTablet": true,
+      "bundleIdentifier": "com.ramcraftlabs.sudoku"
     },
     "android": {
-      "package": "com.anonymous.sudoku"
+      "package": "com.ramcraftlabs.sudoku"
     },
     "web": {
       "favicon": "./assets/favicon.png"
