@@ -9,6 +9,7 @@ export const DAILY_LOCAL_KEY = '@sudoku_daily_challenges_v1';
 export const DAILY_STREAK_KEY = '@sudoku_daily_streak_v1';
 export const ACHIEVEMENTS_KEY = '@sudoku_achievements_v1';
 export const CUSTOM_PROFILE_KEY = '@sudoku_custom_profile_v1';
+export const LOGIN_STREAK_KEY = '@sudoku_login_streak_v1';
 
 const SCORING_RULES: Record<number, Record<string, { base: number; avgTime: number }>> = {
   3: { easy: { base: 100, avgTime: 18 }, medium: { base: 200, avgTime: 36 }, hard: { base: 300, avgTime: 60 }, expert: { base: 400, avgTime: 90 } },
@@ -25,6 +26,45 @@ export const ACHIEVEMENTS_METADATA = [
   { id: 'consistent_7', title: 'Consistency Champion', description: '7-day Daily Challenge streak', icon: '🔥', tier: 'silver' },
   { id: 'grandmaster', title: 'Grandmaster', description: 'Reach 10,000 Career XP', icon: '👑', tier: 'diamond' },
 ];
+
+function getTodayString(): string {
+  const d = new Date();
+  const year = d.getFullYear();
+  const month = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+}
+
+export async function processDailyLogin() {
+  const today = getTodayString();
+  const raw = await AsyncStorage.getItem(LOGIN_STREAK_KEY);
+  const data = raw ? JSON.parse(raw) : { lastLogin: '', streak: 0 };
+
+  if (data.lastLogin === today) return null;
+
+  let newStreak = 1;
+  if (data.lastLogin) {
+    const yesterday = new Date();
+    yesterday.setDate(yesterday.getDate() - 1);
+    const yesterdayStr = `${yesterday.getFullYear()}-${String(yesterday.getMonth() + 1).padStart(2, '0')}-${String(yesterday.getDate()).padStart(2, '0')}`;
+    
+    if (data.lastLogin === yesterdayStr) {
+      newStreak = data.streak + 1;
+    }
+  }
+
+  await AsyncStorage.setItem(LOGIN_STREAK_KEY, JSON.stringify({ lastLogin: today, streak: newStreak }));
+  
+  const rawStats = await AsyncStorage.getItem(STATS_KEY);
+  const localStats = rawStats ? JSON.parse(rawStats) : {};
+  if (!localStats['Rewards - DAILY']) {
+    localStats['Rewards - DAILY'] = { started: 0, won: 0, totalScore: 0, streak: 0, bestScore: 0, perfectGames: 0, bestTime: null };
+  }
+  localStats['Rewards - DAILY'].totalScore = (localStats['Rewards - DAILY'].totalScore || 0) + 50;
+  await AsyncStorage.setItem(STATS_KEY, JSON.stringify(localStats));
+
+  return { streak: newStreak, hintsAwarded: 1, xpAwarded: 50 }; 
+}
 
 export function calculateLocalRunScore(
   gridSize: number,
@@ -62,6 +102,28 @@ export type LeaderboardEntry = {
   isFollowing?: boolean;
   rank?: number;
 };
+
+export async function fetchGlobalTelemetry() {
+  await new Promise(resolve => setTimeout(resolve, 800));
+  return {
+    activePlayers: Math.floor(1200 + Math.random() * 500),
+    dailyCompletionPercentage: 68,
+  };
+}
+
+export function computeProfileSummaryMetrics(stats: Record<string, any>) {
+  let totalWins = 0;
+  let perfectGames = 0;
+  let bestStreakOverall = 0;
+
+  Object.values(stats).forEach((item: any) => {
+    totalWins += item.won || 0;
+    perfectGames += item.perfectGames || 0;
+    bestStreakOverall = Math.max(bestStreakOverall, item.streak || 0);
+  });
+
+  return { totalWins, perfectGames, bestStreakOverall };
+}
 
 export async function fetchGlobalLeaderboard(
   type: 'career' | 'peak' = 'career',
@@ -121,29 +183,27 @@ export async function toggleFollowUser(targetUserId: string, follow: boolean): P
   }
 }
 
-// ---------------- PROFILE CUSTOMIZATION ---------------- //
-
 export async function updateCustomProfile(displayName: string, avatarUrl: string | null): Promise<boolean> {
-  try {
-    const localProfile = { displayName, avatarUrl };
-    await AsyncStorage.setItem(CUSTOM_PROFILE_KEY, JSON.stringify(localProfile));
-
-    const { data: { user } } = await supabase.auth.getUser();
-    if (user) {
-      const { error } = await supabase.from('profiles').upsert({
-        id: user.id,
-        display_name: displayName,
-        avatar_url: avatarUrl,
-        updated_at: new Date().toISOString(),
-      });
-      return !error;
+    try {
+      const localProfile = { displayName, avatarUrl };
+      await AsyncStorage.setItem(CUSTOM_PROFILE_KEY, JSON.stringify(localProfile));
+  
+      const { data: { user } } = await supabase.auth.getUser();
+      if (user) {
+        const { error } = await supabase.from('profiles').upsert({
+          id: user.id,
+          display_name: displayName,
+          avatar_url: avatarUrl,
+          updated_at: new Date().toISOString(),
+        });
+        return !error;
+      }
+      return true;
+    } catch (err) {
+      console.error('Profile update error:', err);
+      return false;
     }
-    return true;
-  } catch (err) {
-    console.error('Profile update error:', err);
-    return false;
   }
-}
 
 export async function getCustomProfile(): Promise<{ displayName: string; avatarUrl: string | null } | null> {
   try {
@@ -153,8 +213,6 @@ export async function getCustomProfile(): Promise<{ displayName: string; avatarU
     return null;
   }
 }
-
-// ---------------- DATA COMPLIANCE & EXPORT ---------------- //
 
 export async function exportUserDataJson(): Promise<void> {
   try {
@@ -207,8 +265,6 @@ export async function deleteUserCloudDataRpc(): Promise<boolean> {
     return false;
   }
 }
-
-// ---------------- LOCAL & REMOTE ACHIEVEMENTS ---------------- //
 
 export async function evaluateLocalAchievements(
   run: { gridSize: number; difficulty: string; timeSeconds: number; mistakes: number; hintsUsed: number; status: 'won' | 'lost' },
@@ -302,6 +358,7 @@ export async function recordGameRunToSupabase(run: {
     const currentCat = localStats[diffKey] || {
       started: 0,
       won: 0,
+      perfectGames: 0,
       bestTime: null,
       streak: 0,
       totalScore: 0,
@@ -312,6 +369,9 @@ export async function recordGameRunToSupabase(run: {
     if (run.status === 'won') {
       currentCat.won += 1;
       currentCat.streak += 1;
+      if (run.mistakes === 0 && run.hintsUsed === 0) {
+        currentCat.perfectGames = (currentCat.perfectGames || 0) + 1;
+      }
       currentCat.totalScore = (currentCat.totalScore || 0) + earnedScore;
       currentCat.bestScore = Math.max(currentCat.bestScore || 0, earnedScore);
       if (currentCat.bestTime === null || run.timeSeconds < currentCat.bestTime) {
@@ -364,8 +424,6 @@ export async function recordGameRunToSupabase(run: {
   }
 }
 
-// ---------------- DAILY CHALLENGES PERSISTENCE ---------------- //
-
 export type DailyChallengeRun = {
   challengeDate: string;
   status: 'won' | 'lost';
@@ -379,12 +437,15 @@ export type DailyStreakData = {
   currentStreak: number;
   bestStreak: number;
   totalCompleted: number;
+  lastCompletedDate?: string;
 };
 
 export async function recordDailyChallengeRun(run: DailyChallengeRun) {
   try {
     const rawLocal = await AsyncStorage.getItem(DAILY_LOCAL_KEY);
     const localDaily: Record<string, DailyChallengeRun> = rawLocal ? JSON.parse(rawLocal) : {};
+    
+    const wasAlreadyCompleted = localDaily[run.challengeDate] && localDaily[run.challengeDate].status === 'won';
     localDaily[run.challengeDate] = run;
     await AsyncStorage.setItem(DAILY_LOCAL_KEY, JSON.stringify(localDaily));
 
@@ -394,9 +455,29 @@ export async function recordDailyChallengeRun(run: DailyChallengeRun) {
       : { currentStreak: 0, bestStreak: 0, totalCompleted: 0 };
 
     if (run.status === 'won') {
-      streak.currentStreak += 1;
+      const lastDateStr = streak.lastCompletedDate;
+      
+      if (!lastDateStr) {
+        streak.currentStreak = 1;
+        streak.lastCompletedDate = run.challengeDate;
+      } else if (run.challengeDate > lastDateStr) {
+        const runDate = new Date(run.challengeDate);
+        const lastDate = new Date(lastDateStr);
+        const diffDays = Math.round((runDate.getTime() - lastDate.getTime()) / (1000 * 3600 * 24));
+        
+        if (diffDays === 1) {
+          streak.currentStreak += 1;
+        } else {
+          streak.currentStreak = 1; 
+        }
+        streak.lastCompletedDate = run.challengeDate;
+      }
+
       streak.bestStreak = Math.max(streak.bestStreak, streak.currentStreak);
-      streak.totalCompleted += 1;
+      if (!wasAlreadyCompleted) {
+        streak.totalCompleted += 1;
+      }
+      
       await AsyncStorage.setItem(DAILY_STREAK_KEY, JSON.stringify(streak));
     }
 
@@ -484,6 +565,7 @@ export async function fetchUserDailyStreak(): Promise<DailyStreakData | null> {
     if (error || !data) return localStreak;
 
     const updated: DailyStreakData = {
+      ...localStreak,
       currentStreak: data.current_streak || 0,
       bestStreak: data.best_streak || 0,
       totalCompleted: data.total_completed || 0,
@@ -496,8 +578,6 @@ export async function fetchUserDailyStreak(): Promise<DailyStreakData | null> {
     return null;
   }
 }
-
-// ---------------- ACTIVE GAME PERSISTENCE ---------------- //
 
 export async function syncActiveGameToCloud(payload: any) {
   try {
@@ -544,8 +624,6 @@ export async function clearActiveGameFromCloud() {
   }
 }
 
-// ---------------- STATS & REHYDRATION ---------------- //
-
 export async function fetchUserStatsFromCloud() {
   try {
     const { data: { user } } = await supabase.auth.getUser();
@@ -556,7 +634,7 @@ export async function fetchUserStatsFromCloud() {
 
     const { data, error } = await supabase
       .from('user_statistics')
-      .select('grid_size, difficulty, started, won, streak, best_time_seconds, total_score, best_score')
+      .select('grid_size, difficulty, started, won, perfect_games, streak, best_time_seconds, total_score, best_score')
       .eq('user_id', user.id);
 
     if (error || !data) {
@@ -572,7 +650,7 @@ export async function fetchUserStatsFromCloud() {
       9: '9x9',
     };
 
-    const formatted: Record<string, { started: number; won: number; bestTime: number | null; streak: number; totalScore: number; bestScore: number }> = {};
+    const formatted: Record<string, { started: number; won: number; perfectGames: number; bestTime: number | null; streak: number; totalScore: number; bestScore: number }> = {};
 
     for (const row of data) {
       const label = sizeToLabel[row.grid_size] || `${row.grid_size}x${row.grid_size}`;
@@ -581,6 +659,7 @@ export async function fetchUserStatsFromCloud() {
       formatted[key] = {
         started: row.started,
         won: row.won,
+        perfectGames: row.perfect_games || 0,
         bestTime: row.best_time_seconds,
         streak: row.streak,
         totalScore: row.total_score || 0,

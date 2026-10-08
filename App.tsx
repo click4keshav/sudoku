@@ -4,6 +4,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { supabase } from './lib/supabase';
 import type { User } from '@supabase/supabase-js';
 import { getCurrentUser, signInWithGoogle, signOutUser } from './lib/auth';
+// import * as Notifications from 'expo-notifications';
 import {
   recordGameRunToSupabase,
   syncUserDataUponLogin,
@@ -20,6 +21,9 @@ import {
   getCustomProfile,
   exportUserDataJson,
   deleteUserCloudDataRpc,
+  computeProfileSummaryMetrics,
+  fetchGlobalTelemetry,
+  processDailyLogin,
   ACHIEVEMENTS_METADATA,
   type DailyChallengeRun,
   type DailyStreakData,
@@ -33,7 +37,6 @@ import {
   useSafeAreaInsets,
 } from 'react-native-safe-area-context';
 import {
-  Alert,
   Image,
   Modal,
   Pressable,
@@ -53,6 +56,8 @@ import Board, {
 import DifficultyPicker from './components/DifficultyPicker';
 import Keypad from './components/Keypad';
 import SizePicker from './components/SizePicker';
+import CustomAlert from './components/CustomAlert';
+import MatchSummaryModal from './components/MatchSummaryModel';
 import {
   DEFAULT_BOARD_LAYOUT,
   BOARD_LAYOUTS,
@@ -61,10 +66,62 @@ import {
 import {
   generate,
   generateDailyChallenge,
+  getValidSolutionIfAny,
   type Difficulty,
 } from './lib/gameLogic';
 
+// Notifications.setNotificationHandler({
+//   handleNotification: async () => ({
+//     shouldShowAlert: true,
+//     shouldPlaySound: true,
+//     shouldSetBadge: false,
+//   } as any),
+// });
+
+const DAILY_NOTIF_ID = 'daily-challenge-reminder';
+const RESUME_NOTIF_ID = 'resume-game-reminder';
+
+async function setupDailyReminder() {
+  // Temporarily disabled for Expo Go
+  /*
+  const { status } = await Notifications.requestPermissionsAsync();
+  if (status !== 'granted') return;
+
+  await Notifications.scheduleNotificationAsync({
+    identifier: DAILY_NOTIF_ID,
+    content: {
+      title: "🧩 New Daily Challenge!",
+      body: "Today's Sudoku board is ready. Keep your streak alive!",
+    },
+    trigger: { hour: 9, minute: 0, repeats: true } as any,
+  });
+  */
+}
+
+const scheduleResumeReminder = async () => {
+  // Temporarily disabled for Expo Go
+  /*
+  await Notifications.cancelScheduledNotificationAsync(RESUME_NOTIF_ID);
+  await Notifications.scheduleNotificationAsync({
+    identifier: RESUME_NOTIF_ID,
+    content: {
+      title: "Unfinished Business ⏱️",
+      body: "Your paused Sudoku game is waiting for you!",
+    },
+    trigger: { seconds: 60 * 60 * 2, repeats: false } as any,
+  });
+  */
+};
+
+const cancelResumeReminder = async () => {
+  // Temporarily disabled for Expo Go
+  /*
+  await Notifications.cancelScheduledNotificationAsync(RESUME_NOTIF_ID);
+  */
+};
+
 const STORAGE_KEY = '@sudoku_save_v4';
+const DAILY_STORAGE_KEY = '@sudoku_daily_save_v1';
 const FAVORITES_KEY = '@sudoku_favorites_v4';
 const SETTINGS_KEY = '@sudoku_settings_v4';
 
@@ -78,6 +135,7 @@ type MoveSnapshot = {
 type CategoryStats = {
   started: number;
   won: number;
+  perfectGames?: number;
   bestTime: number | null;
   streak: number;
   totalScore?: number;
@@ -120,13 +178,6 @@ const DEFAULT_SETTINGS: AppSettings = {
   showTimer: true,
   themeMode: 'light',
   accentTheme: 'classic',
-};
-
-type SmartHint = {
-  row: number;
-  col: number;
-  value: number;
-  reason: string;
 };
 
 function emptyNotes(size: number): NotesGrid {
@@ -187,6 +238,35 @@ function MainApp() {
   const [leaderboardData, setLeaderboardData] = useState<LeaderboardEntry[]>([]);
   const [loadingLeaderboard, setLoadingLeaderboard] = useState(false);
 
+  // Match Summary Modal State
+  const [summaryModalVisible, setSummaryModalVisible] = useState(false);
+  const [lastMatchResult, setLastMatchResult] = useState({
+    isWon: false,
+    timeSeconds: 0,
+    mistakes: 0,
+    hintsUsed: 0,
+    scoreEarned: 0,
+  });
+
+  // Global Telemetry State
+  const [globalTelemetry, setGlobalTelemetry] = useState({ activePlayers: 1248, dailyCompletionPercentage: 68 });
+
+  // Daily Login Bonus State
+  const [loginRewardVisible, setLoginRewardVisible] = useState(false);
+  const [loginRewardData, setLoginRewardData] = useState<{streak: number; hintsAwarded: number; xpAwarded: number} | null>(null);
+
+  // Custom Alert State
+  const [customAlertConfig, setCustomAlertConfig] = useState<{
+    visible: boolean;
+    title: string;
+    message: string;
+    buttons: any[];
+  }>({ visible: false, title: '', message: '', buttons: [] });
+
+  const showAlert = (title: string, message: string, buttons: any[]) => {
+    setCustomAlertConfig({ visible: true, title, message, buttons });
+  };
+
   // Daily Challenge state
   const [calendarModalOpen, setCalendarModalOpen] = useState(false);
   const [isDailyChallengeActive, setIsDailyChallengeActive] = useState(false);
@@ -223,8 +303,6 @@ function MainApp() {
   const [isPaused, setIsPaused] = useState(false);
   const [history, setHistory] = useState<MoveSnapshot[]>([]);
 
-  const [activeHint, setActiveHint] = useState<SmartHint | null>(null);
-
   const [mistakes, setMistakes] = useState(0);
   const [hintsUsed, setHintsUsed] = useState(0);
   const [timerSeconds, setTimerSeconds] = useState(0);
@@ -252,6 +330,7 @@ function MainApp() {
       }
     }
     getAAID();
+    setupDailyReminder();
   }, []);
 
   const isDark = settings.themeMode === 'dark';
@@ -350,7 +429,10 @@ function MainApp() {
     return { totalCareerXP: career, peakSkillScore: peak };
   }, [stats]);
 
-  // Visual Career Analytics breakdown
+  const profileSummary = useMemo(() => {
+    return computeProfileSummaryMetrics(stats);
+  }, [stats]);
+
   const analyticsData = useMemo(() => {
     const diffs: Difficulty[] = ['easy', 'medium', 'hard', 'expert'];
     return diffs.map((diff) => {
@@ -423,7 +505,7 @@ function MainApp() {
     );
     await refreshStats();
     setSyncingNow(false);
-    Alert.alert('Sync Complete', 'All local runs, statistics, and records have been synced with the cloud.');
+    showAlert('Sync Complete', 'All local runs, statistics, and records have been synced with the cloud.', [{ text: 'OK', onPress: () => {} }]);
   };
 
   const handleExportData = async () => {
@@ -431,11 +513,11 @@ function MainApp() {
   };
 
   const handleDeleteCloudData = () => {
-    Alert.alert(
+    showAlert(
       'Delete Cloud Records?',
       'This will permanently delete all your leaderboards, statistics, and challenge runs from the cloud. This action cannot be undone.',
       [
-        { text: 'Cancel', style: 'cancel' },
+        { text: 'Cancel', style: 'cancel', onPress: () => {} },
         {
           text: 'Permanently Delete',
           style: 'destructive',
@@ -446,9 +528,9 @@ function MainApp() {
               setDailyStreak({ currentStreak: 0, bestStreak: 0, totalCompleted: 0 });
               setMonthlyChallenges({});
               setUnlockedAchievements([]);
-              Alert.alert('Deleted', 'Your cloud records have been permanently cleared.');
+              showAlert('Deleted', 'Your cloud records have been permanently cleared.', [{ text: 'OK', onPress: () => {} }]);
             } else {
-              Alert.alert('Error', 'Could not delete records. Please try again.');
+              showAlert('Error', 'Could not delete records. Please try again.', [{ text: 'OK', onPress: () => {} }]);
             }
           },
         },
@@ -458,12 +540,12 @@ function MainApp() {
 
   const handleSaveProfile = async () => {
     if (!customName.trim()) {
-      Alert.alert('Validation', 'Display name cannot be blank.');
+      showAlert('Validation', 'Display name cannot be blank.', [{ text: 'OK', onPress: () => {} }]);
       return;
     }
     await updateCustomProfile(customName.trim(), customAvatar);
     setProfileModalOpen(false);
-    Alert.alert('Saved', 'Your public display profile has been updated!');
+    showAlert('Saved', 'Your public display profile has been updated!', [{ text: 'OK', onPress: () => {} }]);
   };
 
   const loadLeaderboard = useCallback(async () => {
@@ -486,7 +568,7 @@ function MainApp() {
 
   const handleToggleFollow = async (targetUserId: string, currentFollowing: boolean) => {
     if (!user) {
-      Alert.alert('Sign In Required', 'Please sign in with Google to follow players and view your Friends leaderboard.');
+      showAlert('Sign In Required', 'Please sign in with Google to follow players and view your Friends leaderboard.', [{ text: 'OK', onPress: () => {} }]);
       return;
     }
     const success = await toggleFollowUser(targetUserId, !currentFollowing);
@@ -507,7 +589,7 @@ function MainApp() {
 
   const shareGameResult = useCallback((timeSecs: number, totalMistakes: number, totalScore: number) => {
     const mistakesBlock = totalMistakes === 0 ? '🟩🟩🟩 (0 mistakes)' : `${'🟥'.repeat(Math.min(totalMistakes, 3))} (${totalMistakes} errors)`;
-    const text = `🧩 RamCraft Sudoku Daily Challenge\n📅 ${activeDailyDate}\n⏱️ Time: ${formatTime(timeSecs)}\n⚡ Score: +${totalScore} XP\n🎯 Accuracy: ${mistakesBlock}\n\nPlay at: https://ramcraft.app`;
+    const text = `🧩 Sudoku Player Daily Challenge\n📅 ${activeDailyDate}\n⏱️ Time: ${formatTime(timeSecs)}\n⚡ Score: +${totalScore} XP\n🎯 Accuracy: ${mistakesBlock}\n\nPlay at: https://ramcraft.app`;
     Share.share({ message: text });
   }, [activeDailyDate]);
 
@@ -533,9 +615,15 @@ function MainApp() {
   }, []);
 
   useEffect(() => {
-    getCurrentUser().then((u) => {
+    getCurrentUser().then(async (u) => {
       setUser(u);
       if (u) {
+        const existingProf = await getCustomProfile();
+        if (!existingProf && u.email) {
+          const defaultName = u.email.split('@')[0];
+          await updateCustomProfile(defaultName, null);
+          setCustomName(defaultName);
+        }
         syncUserDataUponLogin(
           deviceId,
           (cloudStats) => cloudStats && setStats(cloudStats),
@@ -553,6 +641,12 @@ function MainApp() {
       const currentUser = session?.user ?? null;
       setUser(currentUser);
       if (currentUser) {
+        const existingProf = await getCustomProfile();
+        if (!existingProf && currentUser.email) {
+          const defaultName = currentUser.email.split('@')[0];
+          await updateCustomProfile(defaultName, null);
+          setCustomName(defaultName);
+        }
         await syncUserDataUponLogin(
           deviceId,
           (cloudStats) => cloudStats && setStats(cloudStats),
@@ -572,6 +666,15 @@ function MainApp() {
   useEffect(() => {
     async function loadData() {
       try {
+        const telemetry = await fetchGlobalTelemetry();
+        setGlobalTelemetry(telemetry);
+
+        const reward = await processDailyLogin();
+        if (reward) {
+          setLoginRewardData(reward);
+          setLoginRewardVisible(true);
+        }
+
         const [savedStats, savedSettings, savedFavs, savedGame, customProf] =
           await Promise.all([
             AsyncStorage.getItem(STATS_KEY),
@@ -642,15 +745,19 @@ function MainApp() {
       history,
     };
 
-    AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(state)).catch(() => {});
-    setHasSavedGame(isOngoing);
+    const targetKey = isDailyChallengeActive ? DAILY_STORAGE_KEY : STORAGE_KEY;
+    AsyncStorage.setItem(targetKey, JSON.stringify(state)).catch(() => {});
+    
+    if (!isDailyChallengeActive) {
+      setHasSavedGame(isOngoing);
+    }
 
-    if (isOngoing && user) {
+    if (isOngoing && user && !isDailyChallengeActive) {
       const handler = setTimeout(() => {
         syncActiveGameToCloud(state);
       }, 800);
       return () => clearTimeout(handler);
-    } else if (!isOngoing && user) {
+    } else if (!isOngoing && user && !isDailyChallengeActive) {
       clearActiveGameFromCloud();
     }
   }, [
@@ -695,6 +802,7 @@ function MainApp() {
 
   const startNewGame = useCallback(
     (targetLayout: BoardLayout, targetDifficulty: Difficulty) => {
+      cancelResumeReminder();
       setLayout(targetLayout);
       setDifficulty(targetDifficulty);
 
@@ -712,7 +820,6 @@ function MainApp() {
       setNotes(emptyNotes(targetLayout.size));
       setSelected(null);
       setLockedDigit(null);
-      setActiveHint(null);
       setMistakes(0);
       setHintsUsed(0);
       setTimerSeconds(0);
@@ -728,7 +835,23 @@ function MainApp() {
   );
 
   const startDailyGame = useCallback(
-    (dateStr: string) => {
+    async (dateStr: string) => {
+      cancelResumeReminder();
+      try {
+        const rawDailySave = await AsyncStorage.getItem(DAILY_STORAGE_KEY);
+        if (rawDailySave) {
+          const parsed = JSON.parse(rawDailySave);
+          if (parsed && parsed.activeDailyDate === dateStr && !parsed.isGameOver && !parsed.isWon) {
+            restoreActiveGamePayload(parsed);
+            setCalendarModalOpen(false);
+            setScreen('game');
+            return;
+          }
+        }
+      } catch {
+        // Fallback
+      }
+
       const standard9x9Layout: BoardLayout = {
         id: '9x9',
         label: '9x9',
@@ -752,7 +875,6 @@ function MainApp() {
       setNotes(emptyNotes(9));
       setSelected(null);
       setLockedDigit(null);
-      setActiveHint(null);
       setMistakes(0);
       setHintsUsed(0);
       setTimerSeconds(0);
@@ -766,15 +888,15 @@ function MainApp() {
       setCalendarModalOpen(false);
       setScreen('game');
     },
-    [],
+    [restoreActiveGamePayload]
   );
 
   const restartCurrentGame = useCallback(() => {
-    Alert.alert(
+    showAlert(
       'Restart Puzzle',
       'Are you sure you want to clear all moves and restart this board?',
       [
-        { text: 'Cancel', style: 'cancel' },
+        { text: 'Cancel', style: 'cancel', onPress: () => {} },
         {
           text: 'Restart',
           style: 'destructive',
@@ -794,7 +916,6 @@ function MainApp() {
             setIsPaused(false);
             setSelected(null);
             setLockedDigit(null);
-            setActiveHint(null);
             setHistory([]);
           },
         },
@@ -858,9 +979,13 @@ function MainApp() {
     async (finalTime: number, totalMistakes: number) => {
       if (isAutoSolved) return;
 
+      cancelResumeReminder();
       setIsWon(true);
       setHasSavedGame(false);
       clearActiveGameFromCloud();
+      if (isDailyChallengeActive) {
+        AsyncStorage.removeItem(DAILY_STORAGE_KEY).catch(() => {});
+      }
 
       const res = await recordGameRunToSupabase({
         gridSize: layout.size,
@@ -898,22 +1023,14 @@ function MainApp() {
         await refreshStats();
       }
 
-      const alertButtons: any[] = [
-        { text: 'Home', onPress: () => setScreen('home') },
-      ];
-
-      if (isDailyChallengeActive) {
-        alertButtons.unshift({
-          text: '📤 Share Result',
-          onPress: () => shareGameResult(finalTime, totalMistakes, res?.earnedScore || 100),
-        });
-      }
-
-      Alert.alert(
-        isDailyChallengeActive ? '🌟 Daily Challenge Solved!' : '🎉 Congratulations!',
-        `Puzzle solved in ${formatTime(finalTime)}!\nScore Earned: +${res?.earnedScore || 100} XP`,
-        alertButtons,
-      );
+      setLastMatchResult({
+        isWon: true,
+        timeSeconds: finalTime,
+        mistakes: totalMistakes,
+        hintsUsed: hintsUsed,
+        scoreEarned: res?.earnedScore || 100,
+      });
+      setSummaryModalVisible(true);
     },
     [
       activeDailyDate,
@@ -926,7 +1043,6 @@ function MainApp() {
       refreshAchievements,
       refreshDailyData,
       refreshStats,
-      shareGameResult,
       triggerAchievementBanner,
       user,
     ],
@@ -936,9 +1052,13 @@ function MainApp() {
     async (finalMistakes: number) => {
       if (isAutoSolved) return;
 
+      cancelResumeReminder();
       setIsGameOver(true);
       setHasSavedGame(false);
       clearActiveGameFromCloud();
+      if (isDailyChallengeActive) {
+        AsyncStorage.removeItem(DAILY_STORAGE_KEY).catch(() => {});
+      }
 
       const res = await recordGameRunToSupabase({
         gridSize: layout.size,
@@ -969,6 +1089,15 @@ function MainApp() {
       if (user) {
         await refreshStats();
       }
+
+      setLastMatchResult({
+        isWon: false,
+        timeSeconds: timerSeconds,
+        mistakes: finalMistakes,
+        hintsUsed: hintsUsed,
+        scoreEarned: 0,
+      });
+      setSummaryModalVisible(true);
     },
     [
       activeDailyDate,
@@ -1011,6 +1140,16 @@ function MainApp() {
     return true;
   }, [layout.size, values]);
 
+  const onUndo = useCallback(() => {
+    if (history.length === 0 || isWon || isAutoSolved) return;
+    const previous = history[history.length - 1];
+    setValues(previous.values);
+    setNotes(previous.notes);
+    setErrors(previous.errors);
+    setIsGameOver(false); 
+    setHistory((prev) => prev.slice(0, -1));
+  }, [history, isWon, isAutoSolved]);
+
   const verifyCompletedBoard = useCallback(() => {
     if (isAutoSolved) return;
 
@@ -1034,32 +1173,8 @@ function MainApp() {
       const finalMistakes = mistakes + wrongCount;
       setMistakes(finalMistakes);
       recordLoss(finalMistakes);
-      Alert.alert(
-        'Game Over',
-        `Puzzle verification failed! You had ${wrongCount} incorrect cell(s).`,
-        [
-          { text: 'Try Again', onPress: () => isDailyChallengeActive ? startDailyGame(activeDailyDate) : startNewGame(layout, difficulty) },
-          { text: 'Restart Board', onPress: restartCurrentGame },
-          { text: 'Home', onPress: () => setScreen('home') },
-        ],
-      );
     }
-  }, [
-    activeDailyDate,
-    difficulty,
-    isAutoSolved,
-    isDailyChallengeActive,
-    layout,
-    mistakes,
-    recordLoss,
-    recordWin,
-    restartCurrentGame,
-    solution,
-    startDailyGame,
-    startNewGame,
-    timerSeconds,
-    values,
-  ]);
+  }, [isAutoSolved, layout.size, values, solution, recordWin, timerSeconds, mistakes, recordLoss]);
 
   const clearSurroundingNotes = useCallback(
     (currentNotes: NotesGrid, targetRow: number, targetCol: number, digit: number): NotesGrid => {
@@ -1153,7 +1268,17 @@ function MainApp() {
         return;
       }
 
-      const isCorrect = solution[targetRow]?.[targetCol] === digit;
+      let isCorrect = solution[targetRow]?.[targetCol] === digit;
+
+      if (!isCorrect) {
+         const testBoard = values.map(r => [...r]);
+         testBoard[targetRow][targetCol] = digit;
+         const alternateSolution = getValidSolutionIfAny(testBoard, layout);
+         if (alternateSolution) {
+            isCorrect = true;
+            setSolution(alternateSolution);
+         }
+      }
 
       if (settings.autoCheckErrors) {
         const nextMistakes = isCorrect ? mistakes : mistakes + 1;
@@ -1162,15 +1287,7 @@ function MainApp() {
           setMistakes(nextMistakes);
           if (settings.limitMistakes && nextMistakes >= 3) {
             recordLoss(nextMistakes);
-            Alert.alert(
-              'Game Over',
-              'You made 3 mistakes. Better luck next time!',
-              [
-                { text: 'Try Again', onPress: () => isDailyChallengeActive ? startDailyGame(activeDailyDate) : startNewGame(layout, difficulty) },
-                { text: 'Restart Board', onPress: restartCurrentGame },
-                { text: 'Home', onPress: () => setScreen('home') },
-              ],
-            );
+            return;
           }
         }
       }
@@ -1221,6 +1338,7 @@ function MainApp() {
       layout,
       mistakes,
       notesMode,
+      onUndo,
       pushHistory,
       recordLoss,
       recordWin,
@@ -1263,39 +1381,26 @@ function MainApp() {
   const requestSmartHint = useCallback(() => {
     if (isGameOver || isWon || isPaused || isAutoSolved) return;
 
-    for (let r = 0; r < layout.size; r++) {
-      for (let c = 0; c < layout.size; c++) {
-        if (values[r][c] == null && !initialClues[r][c]) {
-          const correctVal = solution[r][c]!;
-          setActiveHint({
-            row: r,
-            col: c,
-            value: correctVal,
-            reason: `In Row ${r + 1}, Column ${c + 1}, placing ${correctVal} satisfies all surrounding grid and block constraints.`,
-          });
-          setSelected({ row: r, col: c });
-          return;
-        }
-      }
+    if (!selected) {
+      showAlert('Select a Cell', 'Please tap an empty cell on the board first before requesting a hint.', [{ text: 'OK', onPress: () => {} }]);
+      return;
     }
-  }, [initialClues, isAutoSolved, isGameOver, isPaused, isWon, layout.size, solution, values]);
 
-  const applyActiveSmartHint = useCallback(() => {
-    if (!activeHint) return;
+    const { row, col } = selected;
+    if (initialClues[row]?.[col] || values[row]?.[col] != null) {
+      showAlert('Invalid Hint Cell', 'Please select an empty, unplayed cell to receive a hint.', [{ text: 'OK', onPress: () => {} }]);
+      return;
+    }
+
+    if (hintsUsed >= 5) {
+      showAlert('Hint Limit Reached', 'You have used the maximum of 5 hints for this puzzle.', [{ text: 'OK', onPress: () => {} }]);
+      return;
+    }
+
+    const correctVal = solution[row][col]!;
     setHintsUsed((prev) => prev + 1);
-    executeDigitInput(activeHint.row, activeHint.col, activeHint.value);
-    setActiveHint(null);
-  }, [activeHint, executeDigitInput]);
-
-  const onUndo = useCallback(() => {
-    if (history.length === 0 || isGameOver || isWon || isPaused || isAutoSolved) return;
-    const previous = history[history.length - 1];
-    setValues(previous.values);
-    setNotes(previous.notes);
-    setErrors(previous.errors);
-    setMistakes(previous.mistakes);
-    setHistory((prev) => prev.slice(0, -1));
-  }, [history, isAutoSolved, isGameOver, isPaused, isWon]);
+    executeDigitInput(row, col, correctVal);
+  }, [executeDigitInput, hintsUsed, initialClues, isAutoSolved, isGameOver, isPaused, isWon, selected, solution, values]);
 
   const onErase = useCallback(() => {
     if (selected == null || isGameOver || isWon || isPaused || isAutoSolved) return;
@@ -1317,11 +1422,11 @@ function MainApp() {
 
   const onSolveBoard = useCallback(() => {
     if (solution.length === 0 || isGameOver || isWon || isAutoSolved) return;
-    Alert.alert(
+    showAlert(
       'Reveal Solution?',
       'Solving the board automatically allows you to inspect the solution, but will not count towards your stats, win count, or records.',
       [
-        { text: 'Cancel', style: 'cancel' },
+        { text: 'Cancel', style: 'cancel', onPress: () => {} },
         {
           text: 'Reveal Solution',
           style: 'destructive',
@@ -1334,7 +1439,6 @@ function MainApp() {
             setNotes(emptyNotes(layout.size));
             setSelected(null);
             setLockedDigit(null);
-            setActiveHint(null);
           },
         },
       ],
@@ -1343,8 +1447,8 @@ function MainApp() {
 
   const handleAuthAction = async () => {
     if (user) {
-      Alert.alert('Sign Out', 'Do you want to log out of your cloud account?', [
-        { text: 'Cancel', style: 'cancel' },
+      showAlert('Sign Out', 'Do you want to log out of your cloud account?', [
+        { text: 'Cancel', style: 'cancel', onPress: () => {} },
         {
           text: 'Log Out',
           style: 'destructive',
@@ -1352,7 +1456,7 @@ function MainApp() {
             try {
               await signOutUser();
             } catch (err: any) {
-              Alert.alert('Error signing out', err.message);
+              showAlert('Error signing out', err.message, [{ text: 'OK', onPress: () => {} }]);
             }
           },
         },
@@ -1362,7 +1466,7 @@ function MainApp() {
         setAuthLoading(true);
         await signInWithGoogle();
       } catch (err: any) {
-        Alert.alert('Sign-in Error', err.message || 'Could not complete sign in');
+        showAlert('Sign-in Error', err.message || 'Could not complete sign in', [{ text: 'OK', onPress: () => {} }]);
       } finally {
         setAuthLoading(false);
       }
@@ -1370,23 +1474,38 @@ function MainApp() {
   };
 
   const handleBackPress = () => {
-    Alert.alert(
+    showAlert(
       'Leave Game?',
       'Your game progress is saved. You can resume anytime from Home.',
       [
-        { text: 'Cancel', style: 'cancel' },
-        { text: 'Go Home', onPress: () => setScreen('home') },
+        { text: 'Cancel', style: 'cancel', onPress: () => {} },
+        { 
+          text: 'Go Home', 
+          onPress: () => {
+            scheduleResumeReminder();
+            setScreen('home');
+          } 
+        },
       ],
     );
   };
 
-  if (!isLoaded) return null;
+  if (!isLoaded) {
+    return (
+      <View style={{ flex: 1, backgroundColor: '#1E3A8A', alignItems: 'center', justifyContent: 'center' }}>
+        <StatusBar style="light" />
+        <Image source={require('./assets/logo.png')} style={{ width: 120, height: 120, borderRadius: 24, marginBottom: 20 }} resizeMode="contain" />
+        <Text style={{ fontSize: 28, fontWeight: '800', color: '#FFFFFF', letterSpacing: 1 }}>RamCraft</Text>
+        <Text style={{ fontSize: 14, color: '#BAE6FD', marginTop: 12, fontWeight: '600' }}>Syncing global telemetry...</Text>
+      </View>
+    );
+  }
 
   const todayStr = getTodayString();
   const todayChallenge = monthlyChallenges[todayStr];
   const isTodayCompleted = todayChallenge?.status === 'won';
   const avatarUrl = customAvatar || user?.user_metadata?.avatar_url || user?.user_metadata?.picture;
-  const activeDisplayName = customName || user?.user_metadata?.full_name || user?.user_metadata?.name || (user ? 'RamCraft Player' : 'Guest Player');
+  const activeDisplayName = customName || user?.user_metadata?.full_name || user?.user_metadata?.name || (user?.email ? user.email.split('@')[0] : 'Sudoku Player');
 
   const now = new Date();
   const year = now.getFullYear();
@@ -1394,7 +1513,6 @@ function MainApp() {
   const daysInMonth = new Date(year, month + 1, 0).getDate();
   const firstDayIndex = new Date(year, month, 1).getDay();
 
-  // Monthly Crown calculation
   const completedCountInMonth = Object.keys(monthlyChallenges).filter(
     (k) => k.startsWith(`${year}-${String(month + 1).padStart(2, '0')}`) && monthlyChallenges[k].status === 'won',
   ).length;
@@ -1406,7 +1524,73 @@ function MainApp() {
     <View style={[styles.container, { backgroundColor: theme.appBg }]}>
       <StatusBar style={isDark ? 'light' : 'dark'} />
 
-      {/* Real-time Achievement Toast */}
+      <CustomAlert
+        visible={customAlertConfig.visible}
+        title={customAlertConfig.title}
+        message={customAlertConfig.message}
+        buttons={customAlertConfig.buttons}
+        theme={theme}
+        onClose={() => setCustomAlertConfig((prev) => ({ ...prev, visible: false }))}
+      />
+
+      <MatchSummaryModal
+        visible={summaryModalVisible}
+        isWon={lastMatchResult.isWon}
+        timeSeconds={lastMatchResult.timeSeconds}
+        mistakes={lastMatchResult.mistakes}
+        hintsUsed={lastMatchResult.hintsUsed}
+        scoreEarned={lastMatchResult.scoreEarned}
+        isDaily={isDailyChallengeActive}
+        dailyDate={activeDailyDate}
+        theme={theme}
+        onHome={() => {
+          setSummaryModalVisible(false);
+          setScreen('home');
+        }}
+        onPlayAgain={() => {
+          setSummaryModalVisible(false);
+          if (isDailyChallengeActive) {
+            startDailyGame(activeDailyDate);
+          } else {
+            startNewGame(layout, difficulty);
+          }
+        }}
+      />
+
+      {/* Daily Login Reward Modal */}
+      <Modal visible={loginRewardVisible} animationType="fade" transparent>
+        <View style={styles.modalOverlay}>
+          <View style={[styles.modalBox, { backgroundColor: theme.cardBg, alignItems: 'center' }]}>
+            <Text style={{ fontSize: 50, marginBottom: 10 }}>🎁</Text>
+            <Text style={[styles.modalTitle, { color: theme.textPrimary, textAlign: 'center' }]}>Daily Login Bonus!</Text>
+            <Text style={[styles.switchSub, { color: theme.textSecondary, textAlign: 'center', marginBottom: 20 }]}>
+              You're on a {loginRewardData?.streak} day streak! Keep coming back for more rewards.
+            </Text>
+
+            <View style={{ width: '100%', backgroundColor: theme.appBg, borderRadius: 10, padding: 16, marginBottom: 20 }}>
+              <View style={{ flexDirection: 'row', justifyContent: 'space-between', marginBottom: 10 }}>
+                <Text style={{ color: theme.textSecondary, fontWeight: '600' }}>Free Hints</Text>
+                <Text style={{ color: theme.textPrimary, fontWeight: '700' }}>+{loginRewardData?.hintsAwarded}</Text>
+              </View>
+              <View style={{ flexDirection: 'row', justifyContent: 'space-between' }}>
+                <Text style={{ color: theme.textSecondary, fontWeight: '600' }}>Career XP Bonus</Text>
+                <Text style={{ color: '#EAB308', fontWeight: '700' }}>+{loginRewardData?.xpAwarded} XP</Text>
+              </View>
+            </View>
+
+            <Pressable
+              style={[styles.playButton, { backgroundColor: theme.accentBtn, marginTop: 0 }]}
+              onPress={() => {
+                setLoginRewardVisible(false);
+                refreshStats();
+              }}
+            >
+              <Text style={styles.playButtonText}>Claim Rewards</Text>
+            </Pressable>
+          </View>
+        </View>
+      </Modal>
+
       {achievementToast && (
         <View style={styles.achievementToast}>
           <Text style={styles.achievementToastIcon}>{achievementToast.icon}</Text>
@@ -1483,7 +1667,12 @@ function MainApp() {
               </Pressable>
               {!isAutoSolved && (
                 <Pressable
-                  onPress={() => setIsPaused(!isPaused)}
+                  onPress={() => {
+                    const nextState = !isPaused;
+                    setIsPaused(nextState);
+                    if (nextState) scheduleResumeReminder();
+                    else cancelResumeReminder();
+                  }}
                   style={[styles.smallActionBtn, { backgroundColor: theme.cardBg }]}
                 >
                   <Text style={[styles.smallActionText, { color: theme.textPrimary }]}>
@@ -1513,28 +1702,18 @@ function MainApp() {
             layout={layout}
             values={values}
             initialClues={initialClues}
-            errors={errors}
+            errors={settings.highlightDuplicates ? errors : emptyErrors(layout.size)}
             notes={notes}
             selected={selected}
-            hintHighlightCell={activeHint ? { row: activeHint.row, col: activeHint.col } : null}
+            hintHighlightCell={null}
             isPaused={isPaused}
             theme={theme}
-            onResume={() => setIsPaused(false)}
+            onResume={() => {
+              cancelResumeReminder();
+              setIsPaused(false);
+            }}
             onSelectCell={handleSelectCell}
           />
-
-          {/* Smart Hint Explanation Banner */}
-          {activeHint && !isAutoSolved && (
-            <View style={styles.hintBanner}>
-              <View style={{ flex: 1, paddingRight: 8 }}>
-                <Text style={styles.hintBannerTitle}>💡 Smart Hint</Text>
-                <Text style={styles.hintBannerBody}>{activeHint.reason}</Text>
-              </View>
-              <Pressable style={styles.hintApplyBtn} onPress={applyActiveSmartHint}>
-                <Text style={styles.hintApplyBtnText}>Apply</Text>
-              </Pressable>
-            </View>
-          )}
 
           {!settings.autoCheckErrors && isBoardFull && !isGameOver && !isWon && !isAutoSolved ? (
             <Pressable
@@ -1562,7 +1741,7 @@ function MainApp() {
         <View style={styles.tabContainer}>
           <View style={styles.appHeader}>
             <Text style={[styles.appHeaderTitle, { color: theme.textPrimary }]}>
-              {tab === 'home' ? 'RamCraft' : tab === 'stats' ? 'Statistics' : 'Profile'}
+              {tab === 'home' ? 'Sudoku Player' : tab === 'stats' ? 'Statistics' : 'Profile'}
             </Text>
             <View style={styles.topRightActions}>
               <Pressable
@@ -1598,7 +1777,13 @@ function MainApp() {
 
           {tab === 'home' && (
             <View style={styles.homeFixedContainer}>
-              {/* TOP: Daily Challenge Card */}
+              {/* Telemetry / Splash Banner */}
+              <View style={[styles.telemetryBanner, { backgroundColor: theme.cardBg }]}>
+                <Text style={[styles.telemetryText, { color: theme.textSecondary }]}>
+                  🎮 Active Today Globally: <Text style={{ fontWeight: '700', color: theme.userText }}>{globalTelemetry.activePlayers.toLocaleString()} Players</Text>
+                </Text>
+              </View>
+
               <View style={[styles.dailyCard, { backgroundColor: isTodayCompleted ? '#065F46' : '#1E3A8A' }]}>
                 <View style={styles.dailyCardHeader}>
                   <Text style={styles.dailyCardBadge}>
@@ -1622,9 +1807,11 @@ function MainApp() {
                     <Text style={styles.dailyCalendarBtnText}>📅 Calendar</Text>
                   </Pressable>
                 </View>
+                <Text style={{ color: '#BAE6FD', fontSize: 11, marginTop: 10, textAlign: 'center', fontWeight: '600' }}>
+                  🌎 {globalTelemetry.dailyCompletionPercentage}% of players solved today's puzzle
+                </Text>
               </View>
 
-              {/* MIDDLE: 100x100 Logo + Resume Game Below It */}
               <View style={styles.middleSection}>
                 <Image
                   source={require('./assets/logo.png')}
@@ -1636,6 +1823,7 @@ function MainApp() {
                   <Pressable
                     style={styles.resumeCard}
                     onPress={() => {
+                      cancelResumeReminder();
                       setIsPaused(false);
                       setScreen('game');
                     }}
@@ -1649,14 +1837,12 @@ function MainApp() {
                       )}
                     </View>
                     <Text style={styles.resumeDetails}>
-                      {isDailyChallengeActive ? `Daily (${activeDailyDate})` : `${layout.label} • ${difficulty.toUpperCase()}`} • Mistakes:{' '}
-                      {settings.limitMistakes ? `${mistakes}/3` : mistakes}
+                      {layout.label} • {difficulty.toUpperCase()} • Mistakes: {settings.limitMistakes ? `${mistakes}/3` : mistakes}
                     </Text>
                   </Pressable>
                 )}
               </View>
 
-              {/* BOTTOM: Custom Game Controls */}
               <View style={styles.bottomControlsSection}>
                 <SizePicker layout={pickerLayout} onChange={setPickerLayout} />
                 <DifficultyPicker
@@ -1697,7 +1883,6 @@ function MainApp() {
                 <Text style={styles.leaderboardBtnText}>🌍 View Global & Friends Leaderboard</Text>
               </Pressable>
 
-              {/* Visual Career Analytics Section */}
               <Text style={[styles.sectionHeading, { color: theme.textPrimary }]}>
                 Career Analytics & Win Rates
               </Text>
@@ -1713,7 +1898,6 @@ function MainApp() {
                         {item.winRate}% ({item.won}/{item.started} Won) • Avg: {item.avgBestTime > 0 ? formatTime(item.avgBestTime) : '--:--'}
                       </Text>
                     </View>
-                    {/* Visual Progress Bar */}
                     <View style={styles.analyticsBarTrack}>
                       <View
                         style={[
@@ -1815,7 +1999,19 @@ function MainApp() {
                 </Text>
               </Pressable>
 
-              {/* Achievements Showcase Section */}
+              {/* EXPANDED PROFILE METRICS CARD */}
+              <View style={[styles.profileCard, { backgroundColor: theme.cardBg }]}>
+                <Text style={[styles.profileCardTitle, { color: theme.textPrimary }]}>
+                  Career Performance Metrics
+                </Text>
+                <Text style={[styles.profileCardBody, { color: theme.textSecondary }]}>
+                  Total Lifetime Wins: 🏆 {profileSummary.totalWins}{'\n'}
+                  Perfect Games (0 Mistakes/Hints): 🎯 {profileSummary.perfectGames}{'\n'}
+                  Best Active Streak: 🔥 {profileSummary.bestStreakOverall} Games{'\n'}
+                  Career Total XP: ⚡ {totalCareerXP.toLocaleString()} XP
+                </Text>
+              </View>
+
               <View style={[styles.achievementsCard, { backgroundColor: theme.cardBg }]}>
                 <View style={styles.achievementsHeader}>
                   <Text style={[styles.profileCardTitle, { color: theme.textPrimary }]}>
@@ -1853,7 +2049,6 @@ function MainApp() {
                 })}
               </View>
 
-              {/* Daily Streak Card */}
               <View
                 style={[styles.profileCard, { backgroundColor: theme.cardBg }]}
               >
@@ -1867,7 +2062,6 @@ function MainApp() {
                 </Text>
               </View>
 
-              {/* Data Management & Compliance Tools */}
               <View style={[styles.profileCard, { backgroundColor: theme.cardBg }]}>
                 <Text style={[styles.profileCardTitle, { color: theme.textPrimary }]}>
                   Data Management & Cloud Tools
@@ -2004,7 +2198,7 @@ function MainApp() {
         </View>
       )}
 
-      {/* Edit Profile Customization Modal */}
+      {/* Profile Customization Modal */}
       <Modal visible={profileModalOpen} animationType="fade" transparent>
         <View style={styles.modalOverlay}>
           <View style={[styles.modalBox, { backgroundColor: theme.cardBg }]}>
@@ -2073,7 +2267,6 @@ function MainApp() {
               </Pressable>
             </View>
 
-            {/* Monthly Crown Milestone Showcase */}
             <View style={styles.crownMilestoneBox}>
               <Text style={{ fontSize: 20 }}>
                 {monthlyCrownTier === 'gold' ? '👑' : monthlyCrownTier === 'silver' ? '🥈' : monthlyCrownTier === 'bronze' ? '🥉' : '🔒'}
@@ -2175,7 +2368,6 @@ function MainApp() {
               </Pressable>
             </View>
 
-            {/* Scope Toggle: Global vs Friends */}
             <View style={styles.optionRow}>
               <Pressable
                 onPress={() => setFriendsOnly(false)}
@@ -2195,7 +2387,6 @@ function MainApp() {
               </Pressable>
             </View>
 
-            {/* Timeframe Tabs: All-Time, Monthly, Weekly */}
             <View style={[styles.optionRow, { marginTop: 8 }]}>
               {(['all_time', 'monthly', 'weekly'] as Timeframe[]).map((tf) => (
                 <Pressable
@@ -2218,7 +2409,6 @@ function MainApp() {
               ))}
             </View>
 
-            {/* Metric Toggle: Career XP vs Peak Rating */}
             <View style={[styles.optionRow, { marginTop: 8 }]}>
               <Pressable
                 onPress={() => setLeaderboardType('career')}
@@ -2246,7 +2436,7 @@ function MainApp() {
                 <Text
                   style={[
                     styles.segmentSmallText,
-                    leaderboardType === 'peak' && styles.segmentBtnSmallActive,
+                    leaderboardType === 'peak' && styles.segmentSmallTextActive,
                   ]}
                 >
                   🏆 Peak Rating
@@ -2433,7 +2623,7 @@ function MainApp() {
                 <Text
                   style={[
                     styles.segmentText,
-                    settings.themeMode === 'dark' && styles.segmentBtnActive,
+                    settings.themeMode === 'dark' && styles.segmentTextActive,
                   ]}
                 >
                   🌙 Dark
@@ -2515,13 +2705,14 @@ function MainApp() {
                 />
               </View>
 
+              {/* BOARD HIGHLIGHTING TOGGLE */}
               <View style={styles.switchRow}>
                 <View style={{ flex: 1, paddingRight: 10 }}>
                   <Text style={[styles.switchTitle, { color: theme.textPrimary }]}>
-                    Highlight Duplicates
+                    Board Highlighting
                   </Text>
                   <Text style={[styles.switchSub, { color: theme.textSecondary }]}>
-                    Highlight conflicting numbers in row, column, and block
+                    Highlight duplicate numbers and active row/column/block cells
                   </Text>
                 </View>
                 <Switch
@@ -2747,6 +2938,19 @@ const styles = StyleSheet.create({
     paddingTop: 0,
     paddingBottom: 10,
   },
+  telemetryBanner: {
+    width: '100%',
+    maxWidth: 400,
+    paddingVertical: 6,
+    paddingHorizontal: 12,
+    borderRadius: 8,
+    alignItems: 'center',
+    marginBottom: 4,
+  },
+  telemetryText: {
+    fontSize: 12,
+    fontWeight: '600',
+  },
   dailyCard: {
     width: '100%',
     maxWidth: 400,
@@ -2844,6 +3048,7 @@ const styles = StyleSheet.create({
     width: '100%',
     maxWidth: 400,
     alignItems: 'center',
+    marginTop: 4,
   },
   playButton: {
     width: '100%',
